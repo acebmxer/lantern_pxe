@@ -13,7 +13,25 @@ this file is just the entry point to it.
 
 ## Status
 
-Design stage. Nothing has been built yet. No code exists in this repo.
+Stage 1 done: the FastAPI web layer (`web/`) is built and runs standalone in
+a rootless container — auth, users/2FA, settings, image upload/ISO
+processing, iPXE menu generation, SQLite DB + backup/restore, driver
+staging. `podman compose up -d --build` (or `docker compose`) brings up just
+that service; see [compose.yml](compose.yml) and
+[.env.example](.env.example).
+
+Not built yet, per the open questions in [docs/design.md](docs/design.md):
+the host-level DHCP/TFTP service and its privileged reload helper, the
+NFS/HTTP boot-root choice, and SMB placement. `services.dnsmasq.render()`
+writes `dnsmasq.conf` but nothing reloads it yet
+(`services.dnsmasq.trigger_reload()` is a stub); extraction stages files
+under `NFS_DIR`/`SMB_DIR` but nothing serves them yet.
+
+Beacon's Docker-socket self-update feature was deliberately not ported — it
+isn't in design.md's "what carries over" list and conflicts with the
+rootless model. `services.restore.can_restart()` is similarly a stub: there's
+no decided mechanism yet for a rootless container to restart itself, so a
+database restore swaps the file but needs a manual restart to take effect.
 
 ## When told to "start" or "go"
 

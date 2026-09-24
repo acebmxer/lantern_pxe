@@ -1,12 +1,27 @@
 # Lantern PXE
 
+[![Latest release](https://img.shields.io/github/v/release/acebmxer/lantern_pxe)](https://github.com/acebmxer/lantern_pxe/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A self-hosted PXE/iPXE boot server with a login-protected web console —
 same goal and user-facing experience as [Beacon](https://github.com/acebmxer/beacon_pxe),
 built around Podman's rootless model instead of Docker's root-daemon one.
 
-**Status: design/scoping stage. No implementation yet.** See
-[docs/design.md](docs/design.md) for the service topology and what's
-being reused vs. rebuilt.
+**Status: stage 1 — the web management layer is built and runs standalone.**
+The DHCP/TFTP, boot-root, and driver-serving pieces of the topology below
+aren't built yet. See [docs/design.md](docs/design.md) for the service
+topology and what's being reused vs. rebuilt.
+
+## Running the web layer
+
+```
+cp .env.example .env   # edit ADMIN_PASSWORD, SERVER_IP, etc.
+podman compose up -d --build   # or: docker compose up -d --build
+```
+
+Brings up the management console at `http://localhost:8080` (auth, users,
+settings, image upload/processing, driver staging). Nothing serves DHCP,
+TFTP, or boot files to real PXE clients yet — see Status above.
 
 ## Why a separate project instead of a Podman port
 

@@ -1,0 +1,47 @@
+# Lantern PXE — web layer only (stage 1: see docs/design.md for the rest of
+# the topology, which isn't built yet).
+#
+# Builds and runs the FastAPI management UI + API in a rootless Podman
+# container: no privileged flags, no host networking, no socket mounts.
+#
+#   1. Copy .env.example to .env and edit it.
+#   2. podman compose up -d --build   (or: docker compose up -d --build)
+#
+# There is no DHCP/TFTP, HTTP boot root, NFS, or SMB service here yet — those
+# are the parts of the topology docs/design.md leaves open. This brings up
+# just the admin console so it can be built and tested standalone.
+
+services:
+  web:
+    build:
+      context: ./web
+      dockerfile: Containerfile
+    container_name: lantern-web
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      BOOTROOT_DIR: /bootroot
+      TFTP_DIR: /tftp
+      IMAGE_DIR: /images
+      DNSMASQ_DIR: /dnsmasq
+      NFS_DIR: /nfs
+      SMB_DIR: /smb
+    volumes:
+      - ./data:/data:Z
+      - bootroot:/bootroot
+      - ${IMAGE_PATH:-./data/images}:/images:Z
+      - dnsmasqconf:/dnsmasq
+      - nfsroot:/nfs
+      - smbroot:/smb
+      - ./data/drivers:/smb/drivers:Z
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+
+volumes:
+  bootroot:
+  nfsroot:
+  smbroot:
+  dnsmasqconf:

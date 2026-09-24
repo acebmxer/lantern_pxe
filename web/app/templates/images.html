@@ -1,0 +1,308 @@
+{% extends "base.html" %}
+{% block heading %}OS Images{% endblock %}
+{% block content %}
+{% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+
+{% if user.is_admin %}
+<div class="card">
+  <h2>Upload an image</h2>
+  <div class="sub">Upload an <b>ISO</b> file. Linux ISOs are auto-processed: the kernel
+    and initrd are extracted and a boot menu entry is created.</div>
+  <form id="upload-form" method="post" action="/images/upload" enctype="multipart/form-data">
+    <div id="drop-zone" class="drop-zone">
+      <div class="drop-zone-inner">
+        <span class="drop-zone-icon">💿</span>
+        <span class="drop-zone-text">Drop an ISO here, or click to browse</span>
+      </div>
+      <div class="row" style="margin-top:14px;">
+        <div>
+          <label for="name">Display name (optional)</label>
+          <input id="name" name="name" placeholder="e.g. Ubuntu 24.04 Live">
+        </div>
+        <div>
+          <label for="file">ISO file</label>
+          <input id="file" name="file" type="file" accept=".iso" required>
+        </div>
+      </div>
+    </div>
+    <div class="toolbar" style="margin-top:16px;">
+      <button class="btn" id="upload-btn" type="submit">Upload &amp; process</button>
+    </div>
+    <div class="progress" id="upload-progress">
+      <div class="bar-track"><div class="bar-fill" id="upload-bar"></div></div>
+      <div class="bar-label" id="upload-label">Uploading…</div>
+    </div>
+    <div class="alert error" id="upload-error" style="display:none;margin-top:14px;"></div>
+  </form>
+  <div class="alert info" style="margin-top:16px;">
+    <b>Format note:</b> only <span class="mono">.iso</span> is accepted.
+    <b>Windows ISOs</b> boot the installer via wimboot/WinPE: the WinPE boot
+    files are extracted, and the ISO is unpacked to an SMB share that WinPE
+    mounts to run Setup (needs ports 139 + 445 reachable from the client).
+    Linux ISOs have their kernel/initrd extracted and served over HTTP for
+    reliable netboot.
+  </div>
+</div>
+{% endif %}
+
+<div class="card" style="margin-top:18px;">
+  <div class="card-head">
+    <div>
+      <h2>Images</h2>
+      <div class="sub">{{ images|length }} total
+        {% if user.is_admin %} — drag rows to reorder; ★ marks the default boot entry{% endif %}
+      </div>
+    </div>
+  </div>
+  {% if not images %}
+    <p class="muted">No images yet.{% if user.is_admin %} Upload one above.{% endif %}</p>
+  {% else %}
+  <table id="images-table">
+    <thead><tr>
+      {% if user.is_admin %}<th class="drag-col"></th>{% endif %}
+      <th>Name</th><th>OS</th><th>Status</th><th>In menu</th><th>Boot args</th>
+      {% if user.is_admin %}<th></th>{% endif %}
+    </tr></thead>
+    <tbody id="images-tbody">
+    {% for img in images %}
+      <tr data-image-id="{{ img.id }}" data-status="{{ img.status }}"
+          {% if user.is_admin %}draggable="true"{% endif %}>
+        {% if user.is_admin %}
+        <td class="drag-col drag-handle" title="Drag to reorder">⠿</td>
+        {% endif %}
+        <td>
+          <b>{{ img.name }}</b>
+          {% if img.is_default %}<span class="default-star" title="Default boot entry">★</span>{% endif %}
+          <br><span class="muted mono">{{ img.filename }}</span>
+        </td>
+        <td>{{ img.os_family }}</td>
+        <td>
+          <span class="badge {{ img.status }}">{{ 'needs reprocess' if img.status == 'needs_reprocess' else img.status }}</span>
+          {% if img.message %}<br><span class="muted">{{ img.message }}</span>{% endif %}
+        </td>
+        <td>
+          {% if img.status == 'ready' %}
+            <span class="badge {{ 'ready' if img.enabled else 'off' }}">{{ 'shown' if img.enabled else 'hidden' }}</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>
+          {% if user.is_admin and img.status == 'ready' %}
+          <form class="inline-form" method="post" action="/images/{{ img.id }}/args">
+            <input class="mono" name="boot_args" value="{{ img.boot_args }}" style="min-width:220px;">
+            <button class="btn ghost sm" type="submit">Save</button>
+          </form>
+          {% else %}<span class="muted mono">{{ img.boot_args or '—' }}</span>{% endif %}
+        </td>
+        {% if user.is_admin %}
+        <td>
+          <div class="toolbar">
+            {% if img.status == 'ready' %}
+            <form class="inline-form" method="post" action="/images/{{ img.id }}/toggle">
+              <button class="btn ghost sm" type="submit">{{ 'Hide' if img.enabled else 'Show' }}</button>
+            </form>
+            <form class="inline-form" method="post" action="/images/{{ img.id }}/default"
+                  title="{{ 'Clear default' if img.is_default else 'Set as default boot entry' }}">
+              <button class="btn ghost sm {{ 'btn-default-active' if img.is_default }}" type="submit">{{ '★ Default' if img.is_default else '☆ Default' }}</button>
+            </form>
+            <form class="inline-form" method="post" action="/images/{{ img.id }}/retry">
+              <button class="btn ghost sm" type="submit">Reprocess</button>
+            </form>
+            {% endif %}
+            {% if img.status in ('error', 'pending', 'needs_reprocess') %}
+            <form class="inline-form" method="post" action="/images/{{ img.id }}/retry">
+              <button class="btn ghost sm" type="submit">Retry</button>
+            </form>
+            {% endif %}
+            <form class="inline-form" method="post" action="/images/{{ img.id }}/delete"
+                  data-confirm="Delete {{ img.name }} and its boot files?">
+              <button class="btn danger sm" type="submit">Delete</button>
+            </form>
+          </div>
+        </td>
+        {% endif %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+<script nonce="{{ csp_nonce }}">
+(function () {
+  // --- Drag-and-drop ISO upload ------------------------------------------
+  var dropZone = document.getElementById("drop-zone");
+  var fileInput = document.getElementById("file");
+  if (dropZone && fileInput) {
+    dropZone.addEventListener("dragover", function (e) {
+      e.preventDefault();
+      dropZone.classList.add("drop-zone-over");
+    });
+    ["dragleave", "dragend"].forEach(function (evt) {
+      dropZone.addEventListener(evt, function () {
+        dropZone.classList.remove("drop-zone-over");
+      });
+    });
+    dropZone.addEventListener("drop", function (e) {
+      e.preventDefault();
+      dropZone.classList.remove("drop-zone-over");
+      var files = e.dataTransfer && e.dataTransfer.files;
+      if (files && files.length) {
+        var f = files[0];
+        if (!f.name.toLowerCase().endsWith(".iso")) {
+          var errBox = document.getElementById("upload-error");
+          if (errBox) { errBox.textContent = "Only .iso files are supported."; errBox.style.display = "block"; }
+          return;
+        }
+        // Modern browsers support setting files via DataTransfer.
+        try {
+          var dt = new DataTransfer();
+          dt.items.add(f);
+          fileInput.files = dt.files;
+        } catch (ex) { /* older browsers — no-op */ }
+        dropZone.querySelector(".drop-zone-text").textContent = f.name;
+      }
+    });
+  }
+
+  // --- Upload with a live progress bar ------------------------------------
+  var form = document.getElementById("upload-form");
+  if (form) {
+    var btn = document.getElementById("upload-btn");
+    var wrap = document.getElementById("upload-progress");
+    var bar = document.getElementById("upload-bar");
+    var label = document.getElementById("upload-label");
+    var errBox = document.getElementById("upload-error");
+
+    form.addEventListener("submit", function (e) {
+      var fi = form.querySelector('input[type="file"]');
+      if (!fi || !fi.files.length) return;
+
+      var fname = fi.files[0].name.toLowerCase();
+      if (!fname.endsWith(".iso")) {
+        e.preventDefault();
+        errBox.textContent = "Only .iso files are supported. See the README for why.";
+        errBox.style.display = "block";
+        return;
+      }
+
+      e.preventDefault();
+      errBox.style.display = "none";
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", form.action);
+      xhr.upload.addEventListener("progress", function (ev) {
+        if (!ev.lengthComputable) return;
+        var pct = Math.round((ev.loaded / ev.total) * 100);
+        bar.style.width = pct + "%";
+        label.textContent = "Uploading… " + pct + "%";
+      });
+      xhr.addEventListener("load", function () {
+        bar.style.width = "100%";
+        label.textContent = "Upload complete — processing…";
+        window.location = "/images";
+      });
+      xhr.addEventListener("error", function () {
+        btn.disabled = false;
+        errBox.textContent = "Upload failed. Please try again.";
+        errBox.style.display = "block";
+      });
+      btn.disabled = true;
+      wrap.style.display = "block";
+      bar.style.width = "0%";
+      label.textContent = "Uploading…";
+      xhr.send(new FormData(form));
+    });
+  }
+
+  // --- Drag-to-reorder rows -----------------------------------------------
+  var tbody = document.getElementById("images-tbody");
+  if (tbody) {
+    var dragging = null;
+
+    tbody.addEventListener("dragstart", function (e) {
+      dragging = e.target.closest("tr");
+      if (dragging) dragging.classList.add("dragging");
+    });
+    tbody.addEventListener("dragend", function () {
+      if (dragging) { dragging.classList.remove("dragging"); dragging = null; }
+    });
+    tbody.addEventListener("dragover", function (e) {
+      e.preventDefault();
+      var target = e.target.closest("tr");
+      if (target && dragging && target !== dragging) {
+        var rect = target.getBoundingClientRect();
+        var after = e.clientY > rect.top + rect.height / 2;
+        tbody.insertBefore(dragging, after ? target.nextSibling : target);
+      }
+    });
+    tbody.addEventListener("drop", function (e) {
+      e.preventDefault();
+      // POST the new order to the server.
+      var ids = Array.prototype.slice.call(tbody.querySelectorAll("tr[data-image-id]"))
+                  .map(function (r) { return r.dataset.imageId; });
+      var fd = new FormData();
+      fd.append("order", ids.join(","));
+      fetch("/images/order", { method: "POST", body: fd })
+        .catch(function () {});
+    });
+  }
+
+  // --- SSE: toast when processing completes (or fall back to polling) ------
+  var rows = Array.prototype.slice.call(
+    document.querySelectorAll("tr[data-image-id]"));
+  var transient = function (s) { return s === "pending" || s === "processing"; };
+  var hasTransient = rows.some(function (r) { return transient(r.dataset.status); });
+  if (!hasTransient) return;
+
+  var initial = {};
+  rows.forEach(function (r) { initial[r.dataset.imageId] = r.dataset.status; });
+
+  var notified = false;
+  function handleUpdate(items) {
+    var anyDone = false;
+    items.forEach(function (it) {
+      var id = String(it.id);
+      if (id in initial && initial[id] !== it.status &&
+          !transient(it.status)) {
+        anyDone = true;
+        if (it.status === "ready" && window.showToast) {
+          window.showToast("Image ready: processing complete.", "ok");
+        } else if (it.status === "error" && window.showToast) {
+          window.showToast("Image processing failed.", "error");
+        }
+        initial[id] = it.status;
+      }
+    });
+    // Reload the page once per batch to reflect final status in the table.
+    if (anyDone && !notified) {
+      notified = true;
+      setTimeout(function () { window.location.reload(); }, 2000);
+    }
+  }
+
+  // Try SSE first.
+  if (typeof EventSource !== "undefined") {
+    var es = new EventSource("/images/events");
+    es.onmessage = function (e) {
+      try { handleUpdate(JSON.parse(e.data)); } catch (ex) {}
+    };
+    es.onerror = function () { es.close(); startPolling(); };
+    return;
+  }
+
+  // Fallback: polling.
+  function startPolling() {
+    var tick = function () {
+      fetch("/images/status", { headers: { "Accept": "application/json" } })
+        .then(function (res) { return res.ok ? res.json() : null; })
+        .then(function (items) {
+          if (items) handleUpdate(items);
+          setTimeout(tick, 2500);
+        })
+        .catch(function () { setTimeout(tick, 2500); });
+    };
+    setTimeout(tick, 2500);
+  }
+  startPolling();
+})();
+</script>
+{% endblock %}

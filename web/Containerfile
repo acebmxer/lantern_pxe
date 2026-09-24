@@ -1,0 +1,55 @@
+# Runs rootless under Podman — no privileged daemon socket, no root inside the
+# container. See docs/design.md for why this differs from Beacon's web image
+# (which mounts the Docker socket for self-update; not implemented here yet).
+FROM python:3.12-slim-bookworm
+
+# bsdtar (libarchive-tools) and 7z extract kernel/initrd from ISO images without
+# needing a privileged loop mount — this is what makes image processing work
+# unprivileged. grub-efi-amd64-bin + grub-common provide grub-mkstandalone, used
+# to build a self-contained UEFI GRUB binary that multiboots XCP-NG (iPXE itself
+# can't multiboot under UEFI). curl fetches the wimboot binary below.
+# wimtools (wimlib-imagex) injects a startnet.cmd/winpeshl.ini into the Windows
+# boot.wim so WinPE auto-mounts the SMB install share and launches setup.exe.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libarchive-tools p7zip-full grub-efi-amd64-bin grub-common wimtools \
+        curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# wimboot: iPXE's helper kernel that boots Windows PE (boot.wim + bootmgr/BCD)
+# from an in-memory ramdisk. Windows ISOs can't be netbooted as a plain
+# kernel+initrd; wimboot is the standard chain. Copied into the bootroot at
+# startup (services.bootstrap) so it's served at /wimboot.
+ARG WIMBOOT_VERSION=2.8.0
+RUN curl -fsSL -o /usr/local/share/wimboot \
+        "https://github.com/ipxe/wimboot/releases/download/v${WIMBOOT_VERSION}/wimboot"
+
+WORKDIR /app
+
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+COPY tests ./tests
+
+# Build provenance, surfaced in the UI so an admin can tell what is actually
+# deployed. Left at the defaults for a local build.
+#   LANTERN_VERSION - "1.2.3" on a release tag, "main" on a main-branch build
+#   LANTERN_COMMIT  - full git sha of the build
+# Declared after COPY app so a version-only change doesn't rebuild the layers above.
+ARG LANTERN_VERSION=dev
+ARG LANTERN_COMMIT=""
+ENV LANTERN_VERSION=${LANTERN_VERSION} \
+    LANTERN_COMMIT=${LANTERN_COMMIT}
+
+# Rootless: run as an unprivileged, non-root user inside the container too
+# (not just outside it, which is Podman's default). The data/bootroot/tftp/etc.
+# directories config.py creates need to be writable by this user — compose.yml
+# either lets Podman set ownership on named volumes, or the host directories
+# need to be writable by this UID for bind mounts.
+RUN useradd --create-home --uid 1000 lantern
+USER lantern
+
+EXPOSE 8080
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

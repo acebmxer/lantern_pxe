@@ -1,0 +1,120 @@
+"""Auth dependencies and shared template context."""
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
+from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from pathlib import Path
+
+from . import config
+from .db import get_db
+from .models import User
+from .store import get_setting
+
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+def _asset_version() -> str:
+    """Cache-busting token for static assets: newest mtime under static/.
+
+    Bumps automatically whenever a CSS/JS file changes, so browsers re-fetch the
+    stylesheet instead of serving a stale cached copy.
+    """
+    try:
+        return str(int(max(p.stat().st_mtime for p in _STATIC_DIR.glob("*"))))
+    except ValueError:
+        return "0"
+
+
+def _build_version() -> str:
+    """Human-readable description of the running build.
+
+    LANTERN_VERSION is whatever the build set it to, so its shape tells us
+    which kind of build this is: a semver release, a branch build, or an
+    unpublished local build.
+    """
+    ver = config.LANTERN_VERSION
+    short = config.LANTERN_COMMIT[:7]
+    if ver == "dev":
+        return f"dev build ({short})" if short else "dev build"
+    if ver[0].isdigit():
+        return f"v{ver}"
+    return f"{ver} ({short})" if short else ver
+
+
+class RedirectException(Exception):
+    """Raised to bounce unauthenticated users to the login page."""
+
+    def __init__(self, location: str):
+        self.location = location
+
+
+def _user_by_token(db: Session, authorization: str | None) -> User | None:
+    """Return a User if the request carries a valid Bearer token, else None."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization[len("Bearer "):]
+    if not token:
+        return None
+    return db.execute(
+        select(User).where(User.api_token == token)
+    ).scalar_one_or_none()
+
+
+def current_user(request: Request, db: Session = Depends(get_db)) -> User | None:
+    # Prefer Bearer token (API / scripted access) over session cookie.
+    token_user = _user_by_token(db, request.headers.get("authorization"))
+    if token_user is not None:
+        return token_user
+
+    uid = request.session.get("uid")
+    if not uid:
+        return None
+    user = db.get(User, uid)
+    # Reject a session for a deleted user, or one minted before the user's
+    # password last changed (epoch bumped on every password change). Clear the
+    # now-invalid cookie so the browser stops presenting it.
+    if user is None or request.session.get("ep") != user.session_epoch:
+        request.session.clear()
+        return None
+    return user
+
+
+def require_user(request: Request, db: Session = Depends(get_db)) -> User:
+    user = current_user(request, db)
+    if user is None:
+        raise RedirectException("/login")
+    return user
+
+
+def require_admin(request: Request, db: Session = Depends(get_db)) -> User:
+    user = require_user(request, db)
+    if not user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Admin privileges required")
+    return user
+
+
+def render(request: Request, db: Session, template: str, **ctx):
+    """Render a template with common context (current user, theme, active nav)."""
+    user = current_user(request, db)
+    base = {
+        "request": request,
+        "user": user,
+        # Per-request CSP nonce (set by the security_headers middleware); stamped
+        # on every inline <script> so it runs under the nonce-based policy.
+        "csp_nonce": getattr(request.state, "csp_nonce", ""),
+        "theme": get_setting(db, "theme"),
+        "menu_title": get_setting(db, "menu_title"),
+        "asset_version": _asset_version(),
+        # Which build is deployed, shown in the topbar. Server-rendered so
+        # every user sees it, not just admins.
+        "build_version": _build_version(),
+    }
+    base.update(ctx)
+    # Starlette >=1.0 takes the request as the first positional argument
+    # (the old TemplateResponse(name, context) signature was removed).
+    return templates.TemplateResponse(request, template, base)

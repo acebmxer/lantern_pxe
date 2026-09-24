@@ -1,0 +1,1072 @@
+"""Image handling: store ISO uploads and extract Linux kernel/initrd.
+
+Extraction uses bsdtar (libarchive) to read files straight out of the ISO9660
+image — no privileged loop mount, so it works in an unprivileged (rootless)
+container.
+"""
+import logging
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+from ..db import SessionLocal
+from ..models import Image
+from .. import config
+from ..store import all_settings
+from . import ipxe
+
+log = logging.getLogger("lantern.images")
+
+# Where extracted kernels/initrds live, relative to BOOTROOT_DIR.
+EXTRACT_SUBDIR = "os"
+
+# Status for an image whose extraction succeeded but whose files are no longer
+# on disk (see reconcile_statuses). Distinct from "error": nothing went wrong
+# with the ISO, the derived data just has to be rebuilt.
+NEEDS_REPROCESS = "needs_reprocess"
+
+# Candidate (kernel, initrd) path patterns by distro family, checked in order.
+# Patterns are matched case-insensitively against the ISO's file listing.
+KERNEL_PATTERNS = [
+    r"casper/vmlinuz",
+    r"live/vmlinuz.*",
+    r"images/pxeboot/vmlinuz",
+    r"isolinux/vmlinuz.*",
+    r"arch/boot/x86_64/vmlinuz.*",
+    # Fedora 42+ live ISOs ship the kernel as boot/<arch>/loader/linux
+    # (systemd-boot/grub layout) — named "linux", not "vmlinuz".
+    r"boot/[^/]+/loader/linux",
+    r"boot/vmlinuz.*",
+    r"kernel/vmlinuz",
+    r".*/vmlinuz.*",
+    r".*/bzimage",
+]
+INITRD_PATTERNS = [
+    r"casper/initrd.*",
+    r"live/initrd.*",
+    r"images/pxeboot/initrd.*",
+    r"isolinux/initrd.*",
+    r"arch/boot/x86_64/initramfs.*",
+    # Fedora 42+ live ISOs ship the initrd as boot/<arch>/loader/initrd.
+    r"boot/[^/]+/loader/initrd",
+    r"boot/initramfs.*",
+    r"boot/initrd.*",
+    r".*/initrd.*",
+    r".*/initramfs.*",
+]
+
+
+def iso_path(filename: str) -> Path:
+    return config.IMAGE_DIR / filename
+
+
+def _list_7z(path: Path) -> list[str]:
+    """List members via 7z, which reads UDF (modern Windows ISOs use it)."""
+    out = subprocess.run(
+        ["7z", "-slt", "l", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    entries = []
+    for line in out.stdout.splitlines():
+        # 7z -slt prints one "Path = <member>" per file. The first such line is
+        # the archive's own path; skip it by ignoring the absolute ISO path.
+        if line.startswith("Path = "):
+            member = line[len("Path = "):].strip()
+            if member and member != str(path):
+                entries.append(member)
+    return entries
+
+
+def _list_iso(path: Path) -> list[str]:
+    """List ISO members. bsdtar reads ISO9660 (Linux/XCP-NG ISOs); modern
+    Windows ISOs are UDF, which bsdtar can't read — it returns only the ISO9660
+    stub (a lone README). Fall back to 7z, which handles UDF, in that case.
+    """
+    out = subprocess.run(
+        ["bsdtar", "-tf", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    entries = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    # A real bootable ISO has dozens+ of entries; a couple means bsdtar only saw
+    # the ISO9660 stub of a UDF disc. Re-list with 7z to read the UDF volume.
+    real = [e for e in entries if e.lstrip("./").rstrip("/")]
+    if len(real) <= 3:
+        try:
+            return _list_7z(path)
+        except subprocess.CalledProcessError:
+            pass
+    return entries
+
+
+def _match(entries: list[str], patterns: list[str]) -> str | None:
+    for pat in patterns:
+        rx = re.compile(pat + r"$", re.IGNORECASE)
+        for entry in entries:
+            if rx.fullmatch(entry.lstrip("./")):
+                return entry
+    return None
+
+
+def _pair_initrd(kernel: str, initrd: str, entries: list[str]) -> str:
+    """Pick the initrd that matches the chosen kernel's version suffix.
+
+    Archiso ISOs that ship multiple kernels name them in parallel —
+    vmlinuz-linux-cachyos ↔ initramfs-linux-cachyos.img,
+    vmlinuz-linux-cachyos-lts ↔ initramfs-linux-cachyos-lts.img. The plain
+    pattern match can otherwise pair a kernel with another flavour's initrd
+    (whichever lists first), which boots a mismatched initramfs and fails.
+    Falls back to the already-matched initrd when no suffix-paired one exists.
+    """
+    kname = kernel.lstrip("./").rsplit("/", 1)[-1]
+    m = re.match(r"vmlinuz(-.+)$", kname, re.IGNORECASE)
+    if not m:
+        return initrd
+    suffix = m.group(1)  # e.g. "-linux-cachyos-lts"
+    want = re.compile(rf"initramfs{re.escape(suffix)}(\.img)?$", re.IGNORECASE)
+    for entry in entries:
+        if want.fullmatch(entry.lstrip("./").rsplit("/", 1)[-1]):
+            return entry
+    return initrd
+
+
+def _extract_one(iso: Path, member: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as fh:
+        subprocess.run(
+            ["bsdtar", "-xOf", str(iso), member],
+            stdout=fh, check=True,
+        )
+
+
+def _extract_one_7z(iso: Path, member: str, dest: Path) -> None:
+    """Extract one member to dest via 7z (for UDF ISOs bsdtar can't read)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as fh:
+        subprocess.run(
+            ["7z", "e", "-so", str(iso), member],
+            stdout=fh, stderr=subprocess.DEVNULL, check=True,
+        )
+
+
+def _extract_gunzip(iso: Path, member: str, dest: Path) -> None:
+    """Extract a gzip member and write it decompressed (for xen.gz -> xen)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    extract = subprocess.Popen(
+        ["bsdtar", "-xOf", str(iso), member], stdout=subprocess.PIPE)
+    with open(dest, "wb") as fh:
+        gunzip = subprocess.Popen(
+            ["gzip", "-dc"], stdin=extract.stdout, stdout=fh)
+        extract.stdout.close()  # let extract get SIGPIPE if gunzip dies
+        gunzip.communicate()
+    extract.wait()
+    if extract.returncode or gunzip.returncode:
+        raise subprocess.CalledProcessError(
+            extract.returncode or gunzip.returncode, "bsdtar|gzip")
+
+
+def _extract_tree(iso: Path, dest: Path) -> None:
+    """Unpack the whole ISO into dest so its live filesystem can be exported.
+
+    Re-extracts cleanly each time so a Retry can't leave a half-written tree.
+    """
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["bsdtar", "-xf", str(iso), "-C", str(dest)], check=True)
+
+
+def _extract_tree_7z(iso: Path, dest: Path) -> None:
+    """Unpack the whole ISO into dest via 7z (UDF-capable, for Windows ISOs).
+
+    bsdtar can't read the UDF volume modern Windows ISOs use, so the SMB install
+    media is unpacked with 7z. Re-extracts cleanly so a Retry can't leave a
+    half-written tree.
+    """
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["7z", "x", "-y", f"-o{dest}", str(iso)],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def _detect_family(entries: list[str]) -> str:
+    """Windows install ISOs carry sources/*.wim and a root-level bootmgr.
+
+    XCP-NG / XenServer ISOs carry the Xen hypervisor (boot/xen.gz) plus a
+    root-level install.img — these boot via Xen multiboot, not a plain Linux
+    kernel+initrd, so they need their own handling.
+
+    Match precisely: a loose endswith("bootmgr") wrongly flags Ubuntu, whose
+    pool contains the 'efibootmgr' package path.
+    """
+    norm = {e.lower().lstrip("./").rstrip("/") for e in entries}
+    # XCP-NG: Xen multiboot installer.
+    if any(p in norm for p in ("boot/xen.gz", "boot/xen.gz.")) and "install.img" in norm:
+        return "xcpng"
+    for el in norm:
+        base = el.rsplit("/", 1)[-1]
+        # Definitive Windows markers.
+        if el in ("sources/boot.wim", "sources/install.wim"):
+            return "windows"
+        # bootmgr / bootmgr.efi at the ISO root (not nested in a package path).
+        if base in ("bootmgr", "bootmgr.efi") and "/" not in el:
+            return "windows"
+    return "linux"
+
+
+# XCP-NG multiboot files inside the ISO and their fixed extracted names. The
+# renderer (services.ipxe) chains them as xen (multiboot kernel) -> vmlinuz
+# (first module / dom0 kernel) -> install.img (second module / installer initrd).
+#
+# xen.gz MUST be gunzipped: iPXE's multiboot loader reads the multiboot header
+# from the raw image and cannot decompress the gzip itself (see the iPXE
+# XenServer appnote). vmlinuz ships as a raw bzImage and install.img as a module,
+# both loaded as-is.
+XCPNG_FILES = {
+    "boot/vmlinuz": "vmlinuz",
+    "install.img": "install.img",
+}
+
+# dom0 kernel command line for the netinstall, mirroring the ISO's isolinux.cfg
+# "install" label (without the serial console). `netinstall` tells the installer
+# to fetch its packages from a network repo it prompts for (or an answerfile).
+XCPNG_DOM0_ARGS = "netinstall console=tty0"
+XCPNG_XEN_ARGS = "dom0_max_vcpus=1-16 dom0_mem=max:8192M console=vga"
+
+# GRUB modules baked into the standalone UEFI binary: efinet+http to fetch the
+# multiboot files over HTTP, multiboot2 to boot Xen, plus the usual video/part
+# helpers. net_default_server is set by GRUB to whatever it was chainloaded from.
+_GRUB_MODULES = ("multiboot2 http efinet tftp net normal echo linux "
+                 "part_gpt part_msdos gzio all_video test configfile")
+
+
+def _build_xcpng_grub(img: Image, dest_dir: Path, dom0_args: str,
+                      server_ip: str) -> None:
+    """Build a self-contained UEFI GRUB that multiboots this XCP-NG image.
+
+    iPXE cannot multiboot under UEFI (IMAGE_MULTIBOOT is BIOS-only), so for UEFI
+    clients we chainload a grub.efi instead. GRUB *can* multiboot2 under UEFI. The
+    cfg fetches xen/vmlinuz/install.img over HTTP from the server's literal IP —
+    GRUB does not inherit iPXE's ${net_default_server}, and using a hostname would
+    force a DNS lookup that times out ("no DNS reply received").
+    """
+    host = server_ip or "${net_default_server}"
+    base = f"(http,{host})/{EXTRACT_SUBDIR}/{img.id}"
+    # net_bootp brings the interface up via DHCP (IP + routing) before the HTTP
+    # fetch — without it GRUB's network stack is never initialised.
+    cfg = (
+        "set timeout=3\n"
+        'menuentry "XCP-NG" {\n'
+        "    insmod efinet\n"
+        "    insmod http\n"
+        "    net_bootp\n"
+        f"    multiboot2 {base}/xen {XCPNG_XEN_ARGS}\n"
+        f"    module2 {base}/vmlinuz {dom0_args}\n"
+        f"    module2 {base}/install.img\n"
+        "}\n"
+    )
+    cfg_path = dest_dir / "grub.cfg"
+    cfg_path.write_text(cfg)
+    subprocess.run(
+        ["grub-mkstandalone", "-O", "x86_64-efi",
+         "-o", str(dest_dir / "bootx64.efi"),
+         "--modules", _GRUB_MODULES,
+         f"boot/grub/grub.cfg={cfg_path}"],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def _process_xcpng(db, img: Image, iso: Path) -> None:
+    """Extract the XCP-NG Xen multiboot files and build the UEFI GRUB chainload."""
+    dest_dir = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id)
+    dom0_args = img.boot_args or XCPNG_DOM0_ARGS
+    server_ip = all_settings(db).get("server_ip", "")
+    # Clean slate so a reprocess never leaves stale files behind.
+    shutil.rmtree(dest_dir, ignore_errors=True)
+    try:
+        # xen.gz must be decompressed for the multiboot loader.
+        _extract_gunzip(iso, "boot/xen.gz", dest_dir / "xen")
+        for member, name in XCPNG_FILES.items():
+            _extract_one(iso, member, dest_dir / name)
+        _build_xcpng_grub(img, dest_dir, dom0_args, server_ip)
+    except subprocess.CalledProcessError as e:
+        img.status = "error"
+        detail = getattr(e, "stderr", "") or e
+        img.message = f"XCP-NG extraction failed: {detail}"
+        db.commit()
+        return
+
+    # kernel_path = xen (decompressed hypervisor), initrd_path = vmlinuz. The
+    # renderer chainloads the generated bootx64.efi for UEFI multiboot.
+    img.kernel_path = f"{EXTRACT_SUBDIR}/{img.id}/xen"
+    img.initrd_path = f"{EXTRACT_SUBDIR}/{img.id}/vmlinuz"
+    img.boot_args = dom0_args
+    img.status = "ready"
+    img.message = "Extracted Xen multiboot + built UEFI GRUB chainloader"
+    db.commit()
+
+
+# Windows boot files extracted from the ISO for the wimboot chain, mapped to the
+# fixed names the iPXE label references. wimboot loads bootmgr + BCD + boot.sdi +
+# boot.wim into a ramdisk and starts WinPE. Paths are matched case-insensitively
+# because Windows ISOs are inconsistent about case (boot/BCD vs boot/bcd).
+_WINDOWS_FILES = {
+    r"bootmgr": "bootmgr",
+    r"boot/bcd": "bcd",
+    r"boot/boot\.sdi": "boot.sdi",
+    r"sources/boot\.wim": "boot.wim",
+}
+
+# The Windows Setup image inside boot.wim is index 2 (index 1 is the bare WinPE
+# shell). We override index 2's shell with a winpeshl.ini that runs our own
+# lantern-setup.cmd, which maps the SMB share and launches setup.exe from it.
+# wiminfo confirms this layout on standard install media.
+#
+# Why not startnet.cmd? On Windows *Setup* media the boot image does not use
+# startnet.cmd as its shell — Setup is auto-launched by winpeshl (or its
+# built-in default when winpeshl.ini is absent), so a patched startnet.cmd never
+# runs and Setup starts with no install-media drive ("a media driver is
+# missing"). winpeshl.ini is the entry point WinPE Setup actually honors.
+_WIM_SETUP_INDEX = 2
+
+# Samba share name exported for the install media.
+_SMB_SHARE = "install"
+
+# Writable Samba share exported for diagnostics: WinPE copies the Windows Setup
+# logs here after Setup exits, so a failed install can be diagnosed from the
+# Lantern host instead of the client's screen.
+_CAPTURE_SHARE = "capture"
+
+# Drop-in driver folder inside that share, shared by every Windows image (it sits
+# beside the per-image media dirs, so re-extracting an image never clears it).
+_SMB_DRIVERS = "drivers"
+
+# Set True to drop to a WinPE command prompt (after mounting the share) instead
+# of launching Setup — useful for inspecting the mounted media live.
+_WINPE_DIAGNOSTIC = False
+
+
+# winpeshl runs the listed app(s) in order, replacing Setup's default
+# auto-launch. We point it at our own lantern-setup.cmd.
+_WINPESHL_INI = (
+    "[LaunchApps]\r\n"
+    "%SYSTEMDRIVE%\\Windows\\System32\\lantern-setup.cmd\r\n"
+)
+
+# Where lantern-setup.cmd stages a local copy of the drop-in drivers (the WinPE
+# RAM disk is X:), and where the answer file lands inside boot.wim / at runtime.
+_LOCAL_DRIVERS = r"X:\Drivers"
+_UNATTEND_WINPE_PATH = r"X:\Windows\System32\lantern-unattend.xml"
+_UNATTEND_WIM_DEST = "/Windows/System32/lantern-unattend.xml"
+
+# Boot-critical NIC drivers baked into boot.wim (config.NICDRIVERS_DIR). They
+# are drvloaded BEFORE wpeinit so DHCP comes up on the new driver — the SMB
+# drivers share can't serve this purpose, being on the far side of the network
+# the missing driver is needed to reach. /LanternNic in the wim == X:\LanternNic
+# at boot.
+_NIC_WIM_DIR = "/LanternNic"
+_NIC_WINPE_DIR = r"X:\LanternNic"
+
+# Answer file handed to `setup.exe /unattend` so Setup injects the drop-in drivers
+# during its windowsPE pass. DriverPaths is PnP-matched: Setup installs — and
+# reflects as boot-critical into the finished OS — ONLY the driver for hardware
+# actually present. That makes a folder holding several vendors' packages safe;
+# an AMD box won't get an Intel boot driver forced onto it (which would bugcheck
+# 0x7B), and vice versa. It points at the LOCAL copy (_LOCAL_DRIVERS), not the SMB
+# share, so the pass never depends on the network. No other settings are present,
+# so everything else in Setup stays interactive.
+#
+# processorArchitecture is amd64: Lantern's Windows images are x64. (An arm64
+# image would need "arm64" here, but Lantern doesn't build those.)
+def _unattend_xml() -> str:
+    """The answer file handing Setup the drop-in STORAGE drivers.
+
+    Only _LOCAL_DRIVERS (the local copy of the SMB share) is listed. It always
+    exists — lantern-setup.cmd creates it before launching Setup — so the pass
+    never errors on a missing path, and an empty folder just injects nothing.
+
+    Baked NIC drivers are deliberately NOT listed here. DriverPaths runs in the
+    windowsPE pass and re-services matching devices; on a machine booting its
+    install media over that very NIC (an Intel NUC on I225, say), re-servicing
+    the live adapter drops the SMB connection Setup is reading from and WinPE
+    bugchecks the instant Setup starts. The NIC driver is already loaded in
+    WinPE for connectivity (see _lantern_setup_cmd), which is all the install
+    needs; the installed OS gets its NIC driver from Windows Update or inbox.
+    Storage drivers don't have this problem — nothing is booting over the disk
+    controller — so they stay.
+    """
+    paths = [_LOCAL_DRIVERS]
+    entries = "".join(
+        f'        <PathAndCredentials wcm:action="add" wcm:keyValue="{i}">\r\n'
+        f'          <Path>{p}</Path>\r\n'
+        '        </PathAndCredentials>\r\n'
+        for i, p in enumerate(paths, start=1)
+    )
+    # The UserData/ProductKey block is required, not optional: with an answer
+    # file present, the classic Setup resolves the target edition from it
+    # instead of asking, and on multi-edition media without an ei.cfg a missing
+    # ProductKey is a modal "Windows cannot read the <ProductKey> setting"
+    # error before the first screen. An explicitly EMPTY key means "no key
+    # now": Setup shows the normal interactive edition list, keeping the rest
+    # of the install as stock as before.
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\r\n'
+        '<unattend xmlns="urn:schemas-microsoft-com:unattend">\r\n'
+        '  <settings pass="windowsPE">\r\n'
+        '    <component name="Microsoft-Windows-Setup"\r\n'
+        '               processorArchitecture="amd64"\r\n'
+        '               publicKeyToken="31bf3856ad364e35" language="neutral"\r\n'
+        '               versionScope="nonSxS"\r\n'
+        '               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">\r\n'
+        '      <UserData>\r\n'
+        '        <ProductKey>\r\n'
+        '          <Key></Key>\r\n'
+        '        </ProductKey>\r\n'
+        '      </UserData>\r\n'
+        '    </component>\r\n'
+        '    <component name="Microsoft-Windows-PnpCustomizationsWinPE"\r\n'
+        '               processorArchitecture="amd64"\r\n'
+        '               publicKeyToken="31bf3856ad364e35" language="neutral"\r\n'
+        '               versionScope="nonSxS"\r\n'
+        '               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">\r\n'
+        '      <DriverPaths>\r\n'
+        f'{entries}'
+        '      </DriverPaths>\r\n'
+        '    </component>\r\n'
+        '  </settings>\r\n'
+        '</unattend>\r\n'
+    )
+
+
+def _driver_lines(drivers_share: str) -> list[str]:
+    """Batch lines that stage drop-in storage drivers for Setup.
+
+    Stock Windows 11 WinPE has no driver for Intel VMD / RST (or AMD RAID), so on
+    machines that ship with those enabled in firmware — most laptops from Intel's
+    11th gen on — Setup enumerates zero disks and stops at "we couldn't find any
+    drives". The media is fine; WinPE just can't see the controller. (Linux is
+    unaffected: it has both NVMe and VMD support in-kernel.)
+
+    The drivers are staged locally and handed to Setup via an answer file
+    (_unattend_xml -> `setup.exe /unattend`). Setup's windowsPE pass loads them
+    as it starts — which is what populates the disk list — and reflects the
+    matching boot-critical driver into the *installed* OS so it boots
+    (otherwise: INACCESSIBLE_BOOT_DEVICE / 0x7B). DriverPaths is PnP-matched
+    and PnP-ranked: only the best driver for hardware actually present is
+    used, which keeps a folder holding several vendors — or several versions —
+    of a package safe. The copy is local so the pass never reads over SMB.
+
+    We deliberately do NOT `drvload` these .infs ourselves. Force-loading a
+    storage .inf live-binds a boot-critical miniport, and Setup's own windowsPE
+    driver pass then re-services that same bound controller — which bugchecks
+    WinPE on a real VMD/RAID machine the instant Setup starts (a VM without the
+    controller never binds, so it never shows). The answer file alone is the
+    supported path (it's how MDT/SCCM inject these) and populates the disk list
+    just as early. The baked NIC sweep in _lantern_setup_cmd is different on
+    purpose: it runs before networking exists, nothing is using the NIC yet, and
+    NICs aren't boot-critical to WinPE (X: is a ramdisk).
+
+    We also do NOT use `setup.exe /ReflectDrivers`: empirically it aborts the
+    file-copy at ~5-8% with a generic "installation has failed" (a VM that
+    installs cleanly with plain setup.exe fails the instant the flag is added).
+
+    All of it is skipped when the share is absent or holds no .inf, so an empty
+    drivers folder costs nothing and Setup runs exactly as before.
+    """
+    return [
+        "set SETUPOPT=",
+        rf'net use Z: {drivers_share} /user:guest "" >nul 2>&1',
+        "if not exist Z:\\ goto nodrv",
+        "dir /b /s Z:\\*.inf >nul 2>&1 || goto nodrv",
+        "echo Staging storage drivers for Setup ...",
+        # Local copy + answer file; Setup loads these itself (PnP-ranked) as it
+        # starts. No drvload here — see the docstring for the bugcheck story.
+        rf"md {_LOCAL_DRIVERS} >nul 2>&1",
+        rf"xcopy Z:\ {_LOCAL_DRIVERS}\ /E /I /Y /Q >nul",
+        rf"set SETUPOPT=/unattend:{_UNATTEND_WINPE_PATH}",
+        ":nodrv",
+    ]
+
+
+def _lantern_setup_cmd(server_ip: str, image_id: int) -> str:
+    """Build the script winpeshl runs: mount the SMB share and launch Setup.
+
+    iPXE can't present the ISO to WinPE as a drive under UEFI (sanhook is BIOS
+    INT 13h only), so instead WinPE pulls the install media from Samba. wpeinit
+    brings up networking + DHCP; then we map the read-only guest share and launch
+    setup.exe from it. The server IP is baked in: WinPE has no DNS for our host.
+
+    This is invoked via winpeshl.ini (not startnet.cmd): on Windows Setup media
+    the boot image auto-launches Setup and ignores startnet.cmd, so overriding
+    winpeshl is the only way to inject our own pre-Setup steps.
+
+    It also drvloads any drop-in drivers from the share before starting Setup —
+    see _driver_lines.
+
+    CRLF line endings — this runs as a Windows batch file.
+    """
+    host = server_ip or "%SERVER_IP%"
+    share = rf"\\{host}\{_SMB_SHARE}\{image_id}"
+    drivers = rf"\\{host}\{_SMB_SHARE}\{_SMB_DRIVERS}"
+    lines = [
+        "@echo off",
+        # Hold a bugcheck's stop screen instead of letting WinPE auto-reboot, so
+        # a driver crash is a readable stop code rather than a silent reboot loop.
+        r"reg add HKLM\SYSTEM\CurrentControlSet\Control\CrashControl"
+        r" /v AutoReboot /t REG_DWORD /d 0 /f >nul 2>&1",
+        # Baked-in NIC drivers load BEFORE wpeinit so its DHCP runs on the new
+        # driver — this is the machine whose NIC stock WinPE doesn't know (the
+        # SMB share can't help; it's on the far side of that network). Loading
+        # every variant is safe here: a wrong-OS .inf just refuses (platform
+        # decoration), and nothing is using the NIC yet, so a re-bind when two
+        # variants match is a non-event — unlike storage drivers under a live
+        # Setup, which is why the Z: staging is PnP-guarded via the unattend.
+        rf"if not exist {_NIC_WINPE_DIR}\ goto nonicload",
+        "echo Loading baked-in network drivers ...",
+        rf'for /r {_NIC_WINPE_DIR} %%f in (*.inf) do drvload "%%f"',
+        ":nonicload",
+        "wpeinit",
+        rf"echo Connecting to Lantern install share {share} ...",
+        # Bounded retry (DHCP may not be ready on the first try). Show the real
+        # `net use` error on each attempt instead of silently looping forever —
+        # a silent infinite loop just makes the firmware reboot with no clue why.
+        #
+        # 40 tries ~= 2 minutes. It needs to be this long because of error 53
+        # after a reset mid-install: the server still holds the previous session's
+        # TCP socket, WinPE reuses the same ephemeral port, and its SYN is answered
+        # with a challenge ACK until that socket is reaped (~25s). A 30s window
+        # lost that race.
+        "set /a tries=0",
+        ":retry",
+        "set /a tries+=1",
+        rf'net use Y: {share} /user:guest ""',
+        "if exist Y:\\setup.exe goto run",
+        "if %tries% geq 40 goto failed",
+        "echo   mount attempt %tries% failed; retrying in 3s ...",
+        "ping -n 4 127.0.0.1 >nul",
+        "goto retry",
+        ":failed",
+        "echo.",
+        "echo *** Could not mount the install share after %tries% tries. ***",
+        rf"echo Server: {host}   Share: {share}",
+        "echo --- ipconfig ---",
+        "ipconfig",
+        rf"echo --- ping {host} ---",
+        rf"ping -n 3 {host}",
+        "echo Dropping to a prompt so you can diagnose (try the net use by hand).",
+        "cmd",
+        "goto end",
+        ":run",
+    ]
+    if _WINPE_DIAGNOSTIC:
+        # Don't launch Setup; show what WinPE can see on the share, then drop to
+        # a prompt so we can inspect the mounted media live.
+        lines += [
+            "echo === Lantern diagnostics ===",
+            "net use",
+            "dir Y:\\",
+            "dir Y:\\sources\\install.* Y:\\sources\\setup*.*",
+            "type Y:\\sources\\install.wim >nul 2>&1 && echo READ_OK || echo READ_FAIL",
+            "echo === end diagnostics; dropping to a prompt ===",
+            "cmd",
+        ]
+    else:
+        lines += _driver_lines(drivers)
+        lines += [
+            # Pre-mount the diagnostics share and create this run's folder BEFORE
+            # Setup, so Setup can write its own logs there via /copylogs at the
+            # moment it fails — robust even when a failure reboots the machine
+            # (our post-exit :capture only runs if setup.exe returns to us). This
+            # is what makes a 0x80070035 ("network path not found") mid-install
+            # diagnosable: Setup re-copies its logs at failure time. The share is
+            # opt-in (ENABLE_DIAG_CAPTURE, off by default), so when it isn't
+            # exported the mount just fails and every capture step no-ops.
+            rf'net use N: \\{host}\{_CAPTURE_SHARE} /user:guest "" >nul 2>&1',
+            rf"set CAPDIR=N:\img{image_id}-%RANDOM%",
+            "set COPYLOGS=",
+            "if exist N:\\ md %CAPDIR% >nul 2>&1",
+            "if exist N:\\ set COPYLOGS=/copylogs %CAPDIR%",
+            "echo Starting Windows Setup ...",
+            # %SETUPOPT% is empty unless drop-in drivers were staged above, in
+            # which case it is "/unattend:<answer file>" (PnP driver injection).
+            # %COPYLOGS% points Setup's own log-copy at the capture folder.
+            #
+            # sources\setup.exe is the CLASSIC Setup. The root Y:\setup.exe is
+            # a stub, and on Win11 24H2-and-later media (verified on 25H2) it
+            # launches the new SetupHost ("media setup") flow instead — which
+            # loads an unattend storage driver into live WinPE (so the disk
+            # list fills in) but never
+            # copies it into the installed OS ("DriverCopy: No drivers." in
+            # setupact.log, C:\$Windows.~BT\Drivers\Unattend left empty), so
+            # every VMD/RAID machine bugchecks 0x7B on first boot. The classic
+            # Setup still runs the windowsPE-pass DriverPaths reflection, and
+            # on pre-24H2 media the root stub chained to sources\setup.exe
+            # anyway, so preferring it changes nothing there.
+            "set SETUPEXE=Y:\\setup.exe",
+            "if exist Y:\\sources\\setup.exe set SETUPEXE=Y:\\sources\\setup.exe",
+            # /copylogs is a SetupHost-flow option; the classic Setup rejects it
+            # with a modal "unknown command-line option" error before doing
+            # anything. Classic-flow failures are still collected by :capture,
+            # which runs when Setup exits back to this script.
+            'if not "%SETUPEXE%"=="Y:\\setup.exe" set COPYLOGS=',
+            "%SETUPEXE% %SETUPOPT% %COPYLOGS%",
+            # Setup returns here only when it exits WITHOUT rebooting — i.e. it
+            # failed early. Add the WinPE-side logs Setup's /copylogs doesn't.
+            "call :capture",
+        ]
+    lines.append(":end")
+    lines.append("goto :eof")
+    lines += _capture_lines(host, image_id)
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _capture_lines(host: str, image_id: int) -> list[str]:
+    """A :capture subroutine that copies WinPE's own Setup logs to the capture
+    share, complementing Setup's /copylogs (which handles the reboot-on-failure
+    case). Best-effort: every step swallows its error, so a missing log or an
+    unreachable share never blocks or hangs the (already failed) install.
+
+    Re-mounts the share in case the failure that triggered this dropped it, and
+    reuses this run's %CAPDIR% (set before Setup) so both log sets land together.
+    """
+    cap = rf"\\{host}\{_CAPTURE_SHARE}"
+    bt = r"X:\$WINDOWS.~BT\Sources\Panther"
+    return [
+        ":capture",
+        rf'net use N: {cap} /user:guest "" >nul 2>&1',
+        "if not exist N:\\ goto capdone",
+        rf'if "%CAPDIR%"=="" set CAPDIR=N:\img{image_id}-%RANDOM%',
+        "md %CAPDIR%\\winpe >nul 2>&1",
+        r"copy X:\Windows\Panther\setupact.log %CAPDIR%\winpe\ >nul 2>&1",
+        r"copy X:\Windows\Panther\setuperr.log %CAPDIR%\winpe\ >nul 2>&1",
+        rf'xcopy "{bt}\*.log" %CAPDIR%\winpe\BT\ /I /Y /Q >nul 2>&1',
+        r"echo Lantern saved the Setup logs. It is safe to power off now.",
+        "net use N: /delete >nul 2>&1",
+        ":capdone",
+        "goto :eof",
+    ]
+
+
+def _patch_boot_wim(wim: Path, server_ip: str, image_id: int) -> None:
+    """Override the Setup image (index 2) shell with our winpeshl + script.
+
+    Adds winpeshl.ini, lantern-setup.cmd and lantern-unattend.xml to
+    \\Windows\\System32 via wimlib's `wimupdate` add command (overwrites in place,
+    no mount, so it works unprivileged in the container). winpeshl.ini makes WinPE
+    run lantern-setup.cmd instead of auto-launching Setup; that script mounts the
+    SMB share, stages any drop-in drivers, and starts setup.exe from it, handing
+    it lantern-unattend.xml so Setup PnP-injects those drivers into the install.
+
+    Boot-critical NIC drivers (config.NICDRIVERS_DIR) are baked in as
+    /LanternNic, drvloaded by the script before wpeinit. The tree is deleted and
+    re-added on every patch so a removed pack actually leaves the wim — `add`
+    alone would only ever overlay.
+    """
+    nic_dir = config.NICDRIVERS_DIR
+    with_nic = any(nic_dir.rglob("*.inf"))
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = Path(tmp) / "lantern-setup.cmd"
+        cmd.write_text(_lantern_setup_cmd(server_ip, image_id), newline="")
+        ini = Path(tmp) / "winpeshl.ini"
+        ini.write_text(_WINPESHL_INI, newline="")
+        xml = Path(tmp) / "lantern-unattend.xml"
+        xml.write_text(_unattend_xml(), newline="")
+        # `add <source> <dest-in-wim>`; overwrites existing files. wimupdate
+        # reads its command list from stdin.
+        commands = (
+            f"delete --force --recursive '{_NIC_WIM_DIR}'\n"
+            f"add '{cmd}' '/Windows/System32/lantern-setup.cmd'\n"
+            f"add '{ini}' '/Windows/System32/winpeshl.ini'\n"
+            f"add '{xml}' '{_UNATTEND_WIM_DEST}'\n"
+        )
+        if with_nic:
+            commands += f"add '{nic_dir}' '{_NIC_WIM_DIR}'\n"
+        subprocess.run(
+            ["wimupdate", str(wim), str(_WIM_SETUP_INDEX)],
+            input=commands, check=True, capture_output=True, text=True,
+        )
+
+
+def _process_windows(db, img: Image, iso: Path, entries: list[str]) -> None:
+    """Prepare a Windows ISO for PXE install via wimboot + SMB.
+
+    1. Extract the WinPE boot files (bootmgr/BCD/boot.sdi/boot.wim) that wimboot
+       loads into a ramdisk to start WinPE.
+    2. Unpack the whole ISO into SMB_DIR/<id> so it can be served as the install
+       media (sources/install.wim et al.) to WinPE.
+    3. Inject winpeshl.ini + lantern-setup.cmd into boot.wim so WinPE maps that
+       share and launches setup.exe from it.
+    """
+    dest_dir = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id)
+    shutil.rmtree(dest_dir, ignore_errors=True)
+    server_ip = all_settings(db).get("server_ip", "")
+    try:
+        for pattern, name in _WINDOWS_FILES.items():
+            member = _match(entries, [pattern])
+            if member is None:
+                img.status = "error"
+                img.message = f"Windows ISO is missing {name} (looked for {pattern})"
+                db.commit()
+                return
+            # Windows ISOs are UDF; extract with 7z (bsdtar can't read UDF).
+            _extract_one_7z(iso, member, dest_dir / name)
+
+        # Unpack the full ISO for the SMB share (Setup reads install.wim there).
+        _extract_tree_7z(iso, config.SMB_DIR / str(img.id))
+
+        # Override WinPE's shell so it mounts the share and runs Setup.
+        _patch_boot_wim(dest_dir / "boot.wim", server_ip, img.id)
+    except subprocess.CalledProcessError as e:
+        img.status = "error"
+        detail = getattr(e, "stderr", "") or e
+        img.message = f"Windows extraction failed: {detail}"
+        db.commit()
+        return
+
+    # kernel_path points at wimboot's WinPE image; the renderer wraps the wimboot
+    # chain (no sanhook — WinPE reaches the media over SMB instead).
+    img.kernel_path = f"{EXTRACT_SUBDIR}/{img.id}/boot.wim"
+    img.initrd_path = f"{EXTRACT_SUBDIR}/{img.id}/bootmgr"
+    img.status = "ready"
+    img.message = "Extracted WinPE + unpacked SMB media; boots via wimboot"
+    db.commit()
+
+
+def _netboot_plan(
+    entries: list[str], filename: str, image_id: int
+) -> tuple[bool, list[tuple[str, str]], str]:
+    """Decide how a live ISO should netboot.
+
+    Returns (needs_nfs, http_files, kernel cmdline):
+      - needs_nfs: unpack the whole ISO and export it over NFS.
+      - http_files: (iso_member, dest_relpath) pairs to extract into the image's
+        bootroot dir (os/<id>/) and stream over HTTP. dest_relpath keeps the
+        on-disc subpath where the bootloader expects it. Empty unless a single-
+        file HTTP root is used (Fedora 42+ live, Archiso); mutually exclusive
+        with needs_nfs.
+
+    casper (Ubuntu) and live (Debian) images mount their squashfs over NFS so the
+    whole ISO never has to fit in client RAM — the old `url=`/`fetch=` methods
+    copied the full image into a tmpfs and fell over on anything but huge clients.
+    nfsroot points at this image's exported tree; ${server-ip} is set in boot.ipxe.
+    Fedora/RHEL already stream their repo over HTTP, so they stay on HTTP.
+    """
+    nfsroot = f"${{server-ip}}:/nfs/{image_id}"
+    iso_url = f"${{boot-url}}/images/{filename}"
+    base = f"${{boot-url}}/{EXTRACT_SUBDIR}/{image_id}"
+    joined = " ".join(e.lower() for e in entries)
+    if "casper/" in joined:  # Ubuntu / casper live
+        return True, [], f"boot=casper netboot=nfs nfsroot={nfsroot} ip=dhcp"
+    if "live/" in joined:    # Debian live
+        return True, [], f"boot=live netboot=nfs nfsroot={nfsroot} ip=dhcp"
+    if "images/pxeboot/" in joined:  # Fedora/RHEL family
+        return False, [], f"inst.repo={iso_url} ip=dhcp"
+    # Fedora 42+ live: dracut dmsquash-live root filesystem under LiveOS/. The
+    # squashfs is extracted to the bootroot and streamed over HTTP — no NFS or
+    # whole-ISO copy needed.
+    squashfs = _match(entries, [r"liveos/squashfs.img"])
+    if squashfs:
+        return False, [(squashfs, "squashfs.img")], (
+            f"root=live:{base}/squashfs.img rd.live.image ip=dhcp")
+    # Archiso (Arch / EndeavourOS / CachyOS): the airootfs squashfs lives under
+    # arch/<arch>/. archiso's initramfs fetches it (and verifies the .sha512)
+    # from archiso_http_srv, keeping the same arch/<arch>/ layout, so extract
+    # both files preserving their subpath.
+    #
+    # BOOTIF is required: archiso's archiso_pxe_common hook re-runs IP-Config to
+    # bring the boot NIC up for the HTTP fetch, and it identifies that NIC by the
+    # BOOTIF=01-<mac> parameter PXELINUX normally appends (IPAPPEND 2). iPXE does
+    # not add it on its own, so without this the hook can't find the interface
+    # ("SIOCGIFFLAGS: No such device") and DHCP times out. ${net0/mac:hexhyp}
+    # expands to aa-bb-cc-dd-ee-ff, giving the 01-<mac> form archiso expects.
+    #
+    # Note: archiso's HTTP boot pulls the whole airootfs.sfs into a RAM tmpfs, so
+    # the live desktop needs ~8 GB to boot (4-6 GB OOMs or thrashes). That's
+    # acceptable: real PXE clients are physical machines with 8+ GB. copytoram=n
+    # was tried to lower this and did not help, so it's not used.
+    sfs = _match(entries, [r"arch/[^/]+/airootfs.sfs"])
+    if sfs:
+        basedir = sfs.lstrip("./").split("/", 1)[0]  # "arch"
+        files = [(sfs, sfs.lstrip("./"))]
+        sha = _match(entries, [r"arch/[^/]+/airootfs.sha512"])
+        if sha:
+            files.append((sha, sha.lstrip("./")))
+        return False, files, (
+            f"archiso_http_srv={base}/ archisobasedir={basedir} "
+            "BOOTIF=01-${net0/mac:hexhyp} ip=dhcp")
+    return False, [], "ip=dhcp"
+
+
+def _clean_derived_data(image_id: int) -> None:
+    """Remove every derived artifact for an image (all families) but keep the ISO.
+
+    Called at the start of each (re)process so a run is always a clean slate: an
+    image whose family or netboot method changed can't leave a stale boot.wim,
+    Xen kernel, or a multi-GB NFS/SMB tree from a previous run behind. The ISO
+    itself lives in IMAGE_DIR and is preserved.
+    """
+    sid = str(image_id)
+    shutil.rmtree(config.BOOTROOT_DIR / EXTRACT_SUBDIR / sid, ignore_errors=True)
+    shutil.rmtree(config.NFS_DIR / sid, ignore_errors=True)
+    shutil.rmtree(config.SMB_DIR / sid, ignore_errors=True)
+
+
+def process_image(image_id: int) -> None:
+    """Run extraction for one image. Intended to run as a background task."""
+    db = SessionLocal()
+    try:
+        img = db.get(Image, image_id)
+        if img is None:
+            return
+        # Mark active extraction so the UI can distinguish "queued" from "working".
+        img.status = "processing"
+        db.commit()
+        # Wipe any artifacts from a previous run before re-extracting, so a
+        # changed family/netboot method can't leave stale (possibly huge) data.
+        _clean_derived_data(image_id)
+        iso = iso_path(img.filename)
+        try:
+            entries = _list_iso(iso)
+        except subprocess.CalledProcessError as e:
+            img.status = "error"
+            img.message = f"Could not read ISO: {e.stderr or e}"
+            db.commit()
+            return
+
+        family = _detect_family(entries)
+        img.os_family = family
+        if family == "windows":
+            _process_windows(db, img, iso, entries)
+            ipxe.render(db)
+            log.info("Image %s ready (%s)", img.name, family)
+            return
+
+        if family == "xcpng":
+            # Xen multiboot installer; handled separately from Linux kernel+initrd.
+            _process_xcpng(db, img, iso)
+            ipxe.render(db)
+            log.info("Image %s ready (%s)", img.name, family)
+            return
+
+        kernel = _match(entries, KERNEL_PATTERNS)
+        initrd = _match(entries, INITRD_PATTERNS)
+        if not kernel or not initrd:
+            img.status = "error"
+            img.message = ("Could not locate kernel/initrd in ISO. You may set "
+                           "paths manually after checking the ISO layout.")
+            db.commit()
+            return
+        # Keep the initrd on the same kernel flavour (multi-kernel Arch ISOs).
+        initrd = _pair_initrd(kernel, initrd, entries)
+
+        dest_dir = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id)
+        try:
+            _extract_one(iso, kernel, dest_dir / "vmlinuz")
+            _extract_one(iso, initrd, dest_dir / "initrd")
+        except subprocess.CalledProcessError as e:
+            img.status = "error"
+            img.message = f"Extraction failed: {e.stderr or e}"
+            db.commit()
+            return
+
+        needs_nfs, http_files, guessed_args = _netboot_plan(
+            entries, img.filename, img.id)
+
+        if needs_nfs:
+            # Unpack the live filesystem so it can be exported.
+            try:
+                _extract_tree(iso, config.NFS_DIR / str(img.id))
+            except subprocess.CalledProcessError as e:
+                img.status = "error"
+                img.message = f"Live filesystem extraction failed: {e.stderr or e}"
+                db.commit()
+                return
+        elif http_files:
+            # Single-file HTTP root (Fedora 42+ live, Archiso): extract just the
+            # root filesystem (+ any checksum) into the bootroot, preserving the
+            # subpath the bootloader expects, so it can be streamed over HTTP.
+            try:
+                for member, relpath in http_files:
+                    _extract_one(iso, member, dest_dir / relpath)
+            except subprocess.CalledProcessError as e:
+                img.status = "error"
+                img.message = f"Live filesystem extraction failed: {e.stderr or e}"
+                db.commit()
+                return
+
+        img.kernel_path = f"{EXTRACT_SUBDIR}/{img.id}/vmlinuz"
+        img.initrd_path = f"{EXTRACT_SUBDIR}/{img.id}/initrd"
+        # Reprocess regenerates everything, so reset boot args to the freshly
+        # guessed ones — a changed family/layout must not keep stale args (e.g.
+        # an Archiso image left on a previous run's bare ip=dhcp).
+        img.boot_args = guessed_args
+        img.status = "ready"
+        img.message = f"Extracted {Path(kernel).name} + {Path(initrd).name}"
+        db.commit()
+
+        ipxe.render(db)
+        log.info("Image %s ready (%s)", img.name, family)
+    finally:
+        db.close()
+
+
+def _exists_nonempty(path: Path) -> bool:
+    """True if path is a file with content, or a directory with something in it.
+
+    An empty directory counts as missing: a destroyed and re-created volume
+    leaves the mount point there but nothing under it.
+    """
+    if not path.exists():
+        return False
+    if path.is_dir():
+        return any(path.iterdir())
+    return path.stat().st_size > 0
+
+
+def _required_paths(img: Image) -> list[Path]:
+    """Everything that must be on disk for this image to actually boot.
+
+    Mirrors what the extraction for each family produced, since that is what the
+    generated menu entry (services.ipxe) points a client at.
+    """
+    dest_dir = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id)
+    paths = []
+    if img.kernel_path:
+        paths.append(config.BOOTROOT_DIR / img.kernel_path)
+    if img.initrd_path:
+        paths.append(config.BOOTROOT_DIR / img.initrd_path)
+
+    if img.os_family == "xcpng":
+        # UEFI clients chainload this; the extracted xen/vmlinuz alone won't boot.
+        paths += [dest_dir / "bootx64.efi", dest_dir / "install.img"]
+    elif img.os_family == "windows":
+        # The rest of the wimboot chain, plus the install media the SMB share
+        # serves — WinPE starts without it and then fails to find setup.exe.
+        paths += [dest_dir / "bcd", dest_dir / "boot.sdi"]
+        paths.append(config.SMB_DIR / str(img.id))
+    else:
+        # Linux: whatever the boot args send the client to beyond kernel+initrd.
+        args = img.boot_args or ""
+        if "netboot=nfs" in args:
+            paths.append(config.NFS_DIR / str(img.id))
+        if "rd.live.image" in args:  # Fedora 42+ live: HTTP squashfs root
+            paths.append(dest_dir / "squashfs.img")
+        basedir = re.search(r"archisobasedir=(\S+)", args)
+        if basedir:
+            paths.append(dest_dir / basedir.group(1))
+    return paths
+
+
+def _missing_message(img: Image, missing: list[Path]) -> str:
+    """Explain what vanished and which action recovers it."""
+    shown = ", ".join(str(p) for p in missing[:3])
+    if len(missing) > 3:
+        shown += f", and {len(missing) - 3} more"
+    if not iso_path(img.filename).exists():
+        return (f"Boot files are missing ({shown}) and so is the ISO "
+                f"{img.filename} — upload the ISO again to restore this image.")
+    return (f"Boot files are missing ({shown}). The ISO is still here, so "
+            "Reprocess rebuilds them.")
+
+
+def reconcile_statuses(db) -> int:
+    """Flag images whose extracted files are gone. Returns the number changed.
+
+    `status` records how the last extraction went; it says nothing about whether
+    what that extraction produced still exists. Destroying and recreating the
+    bootroot/nfsroot/smbroot volumes while the database — a bind mount —
+    survives leaves rows still marked `ready` that point at nothing. Those images
+    were listed in the boot menu and failed at the client with nothing pointing
+    at the real cause.
+
+    Runs at startup, which is the only moment the volumes can have changed
+    without Lantern doing it, and is when the boot menu is regenerated anyway.
+    """
+    changed = 0
+    for img in db.query(Image).all():
+        # No background task survives a restart, so a row still marked in-flight
+        # was interrupted and will never finish on its own.
+        if img.status == "processing":
+            img.status = NEEDS_REPROCESS
+            img.message = ("Extraction was interrupted by a restart and never "
+                           "finished. Reprocess to run it again.")
+            changed += 1
+            continue
+        if img.status != "ready":
+            continue
+        missing = [p for p in _required_paths(img) if not _exists_nonempty(p)]
+        if not missing:
+            continue
+        img.status = NEEDS_REPROCESS
+        img.message = _missing_message(img, missing)
+        log.warning("Image %s (id=%s) is missing %s; marked %s",
+                    img.name, img.id, ", ".join(str(p) for p in missing),
+                    NEEDS_REPROCESS)
+        changed += 1
+
+    if changed:
+        db.commit()
+        log.warning("%d image(s) need reprocessing; they are held out of the "
+                    "boot menu until their files are rebuilt", changed)
+    return changed
+
+
+def delete_image(db, img: Image) -> None:
+    """Remove the ISO, extracted files, DB row, and regenerate the menu."""
+    iso = iso_path(img.filename)
+    iso.unlink(missing_ok=True)
+    extracted = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id)
+    shutil.rmtree(extracted, ignore_errors=True)
+    shutil.rmtree(config.NFS_DIR / str(img.id), ignore_errors=True)
+    shutil.rmtree(config.SMB_DIR / str(img.id), ignore_errors=True)
+    db.delete(img)
+    db.commit()
+    ipxe.render(db)
+
+
+def rebuild_xcpng_grub_all(db) -> None:
+    """Rebuild the GRUB chainloader for every ready XCP-NG image.
+
+    The server IP is baked into each image's grub.efi, so when Server IP changes
+    the chainloaders must be regenerated. This only rewrites grub.cfg + grub.efi
+    from the already-extracted xen/vmlinuz/install.img (no slow re-extraction), so
+    it is cheap to call whenever settings are saved.
+    """
+    server_ip = all_settings(db).get("server_ip", "")
+    for img in db.query(Image).filter(
+            Image.os_family == "xcpng", Image.status == "ready").all():
+        dest_dir = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id)
+        if not (dest_dir / "xen").exists():
+            continue  # extracted files gone; a full reprocess is needed instead
+        try:
+            _build_xcpng_grub(img, dest_dir, img.boot_args or XCPNG_DOM0_ARGS,
+                              server_ip)
+        except subprocess.CalledProcessError as e:
+            log.warning("Rebuilding XCP-NG GRUB for %s failed: %s", img.name, e)
+
+
+def rebuild_windows_setup_all(db) -> int:
+    """Re-patch the WinPE setup script for every ready Windows image.
+
+    The server IP is baked into each boot.wim's lantern-setup.cmd (WinPE has no
+    DNS for our host), so a Server IP change must rewrite it; a change to the
+    baked NIC drivers folder must too, since those live inside the wim. This
+    only re-patches the already-extracted boot.wim — no slow re-unpacking of
+    the SMB tree. Returns how many images were re-patched.
+    """
+    server_ip = all_settings(db).get("server_ip", "")
+    patched = 0
+    for img in db.query(Image).filter(
+            Image.os_family == "windows", Image.status == "ready").all():
+        wim = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id) / "boot.wim"
+        if not wim.exists():
+            continue  # extracted files gone; a full reprocess is needed instead
+        try:
+            _patch_boot_wim(wim, server_ip, img.id)
+            patched += 1
+        except subprocess.CalledProcessError as e:
+            log.warning("Re-patching Windows setup for %s failed: %s",
+                        img.name, e.stderr or e)
+    return patched
