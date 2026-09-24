@@ -1,0 +1,9 @@
+# Lantern PXE: validate the web app's dnsmasq.conf, install it, restart dnsmasq.
+# Installed by host/install.sh; started by lantern-apply.path.
+
+[Unit]
+Description=Apply Lantern's generated DHCP/TFTP config
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/lantern/lantern-host --data-dir @DATA_DIR@ apply --dnsmasq @DNSMASQ@

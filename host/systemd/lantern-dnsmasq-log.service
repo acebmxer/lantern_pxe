@@ -1,0 +1,15 @@
+# Lantern PXE: copy dnsmasq's DHCP log from the journal into the web app's data
+# directory, for the dashboard's recent-clients view.
+# Installed by host/install.sh.
+
+[Unit]
+Description=Forward Lantern's dnsmasq log to the web app
+After=lantern-dnsmasq.service
+
+[Service]
+ExecStart=/usr/local/libexec/lantern/lantern-host --data-dir @DATA_DIR@ logfwd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

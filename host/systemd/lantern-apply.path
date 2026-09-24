@@ -1,0 +1,15 @@
+# Lantern PXE: apply the web app's DHCP/TFTP config whenever it changes.
+# Installed by host/install.sh. The web container only writes these files; it
+# has no way to run anything on the host itself.
+
+[Unit]
+Description=Watch Lantern's generated DHCP/TFTP config
+
+[Path]
+PathChanged=@DATA_DIR@/dnsmasq/dnsmasq.conf
+PathChanged=@DATA_DIR@/tftp/ipxe.efi
+PathChanged=@DATA_DIR@/tftp/undionly.kpxe
+Unit=lantern-apply.service
+
+[Install]
+WantedBy=multi-user.target

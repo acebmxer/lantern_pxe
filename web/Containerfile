@@ -1,6 +1,77 @@
 # Runs rootless under Podman — no privileged daemon socket, no root inside the
 # container. See docs/design.md for why this differs from Beacon's web image
 # (which mounts the Docker socket for self-update; not implemented here yet).
+# ---------------------------------------------------------------------------
+# Build stage: the iPXE network boot programs, from source. Carried over
+# unchanged from Beacon's dnsmasq image (beacon_pxe/dnsmasq/Dockerfile).
+#   ipxe.pxe -> legacy BIOS clients (served as undionly.kpxe)
+#   ipxe.efi -> UEFI clients
+# An embedded script makes the binaries self-chaining: the instant iPXE starts
+# it pulls http://${next-server}/boot.ipxe, so an existing DHCP server only needs
+# next-server + filename. Building (vs downloading boot.ipxe.org binaries) is what
+# lets us embed that script and guarantees matching BIOS + UEFI binaries.
+#
+# We enable iPXE's native USB host-controller + HID keyboard drivers (see the
+# config override below) so iPXE drives the USB keyboard ITSELF instead of
+# depending on the firmware's legacy USB support. On machines whose UEFI/BIOS
+# never enumerates the USB keyboard pre-OS (no Caps/Num lock LEDs, dead keys at
+# the boot menu), this is what makes the keyboard work. Because native USB needs
+# real NIC + USB drivers, the BIOS target is ipxe.pxe, NOT undionly.kpxe:
+# undionly is UNDI-only and carries no native drivers, so it can't drive USB.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS ipxe
+# Which iPXE revision to build (branch, tag, or commit).
+#
+# PINNED ON PURPOSE. This tracked "master" until 2026-08-24, which meant every
+# rebuild silently swapped in whatever iPXE HEAD happened to be that day -- the
+# bootloader changing underneath you is not something you want to discover while
+# debugging a boot failure. This commit is the build verified to boot both a UEFI
+# VM and a physical laptop (it reports itself as "iPXE/2.0.0+ (gd86e8)").
+#
+# To move the pin: build with --build-arg IPXE_REF=<ref>, verify a real client
+# boots, then update this default to the full SHA of what you tested.
+ARG IPXE_REF=d86e86dff8c0091bc16b79c3190e6e2f05d4eda9
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git make gcc gcc-multilib binutils perl liblzma-dev mtools ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone https://github.com/ipxe/ipxe.git /ipxe \
+    && git -C /ipxe checkout "$IPXE_REF"
+WORKDIR /ipxe/src
+# ${next-server} alone is NOT safe here. Under proxyDHCP the client's own DHCP
+# server owns that field and routers routinely stamp it with their own address,
+# so iPXE would chain to the router and get a 403 instead of our menu. iPXE
+# exposes the proxyDHCP offer separately as ${proxydhcp/*}, which is only set
+# when a proxy actually answered -- so prefer it, and fall back to ${next-server}
+# for the external-DHCP case where the admin points next-server at this box.
+# Note we never chain ${filename}: with an external DHCP server that is
+# "ipxe.efi", which would reload iPXE into an infinite loop.
+RUN cat > chain.ipxe <<'IPXE'
+#!ipxe
+dhcp || dhcp
+set menu-url http://${next-server}/boot.ipxe
+isset ${proxydhcp/next-server} && set menu-url http://${proxydhcp/next-server}/boot.ipxe ||
+chain ${menu-url} || shell
+IPXE
+# Enable iPXE's native USB stack + HID keyboard so the boot menu works on
+# machines whose firmware doesn't hand a USB keyboard to the pre-OS environment.
+# USB_HCD_* are the host-controller drivers (xHCI = USB3, the one modern desktops
+# use; EHCI/UHCI for older ports); USB_KEYBOARD is the HID keyboard driver and is
+# commented out in mainline iPXE by default.  config/local/ is iPXE's supported
+# override dir, so we don't patch tracked headers.
+RUN mkdir -p config/local \
+    && printf '#define USB_HCD_XHCI\n#define USB_HCD_EHCI\n#define USB_HCD_UHCI\n#define USB_KEYBOARD\n' \
+        > config/local/usb.h
+# Build with iPXE's default plain VGA text console.  CONSOLE_FRAMEBUFFER is left
+# off on purpose: in framebuffer mode iPXE's keypress decoding drops the ANSI
+# escape sequences the arrow keys emit, so only number keys move the boot-menu
+# highlight.  Plain text mode decodes the arrow keys correctly.
+# BIOS target is ipxe.pxe (full native drivers), not undionly.kpxe (UNDI-only,
+# no native USB).  ipxe.efi already supports native drivers under UEFI.
+RUN make -j"$(nproc)" EMBED=chain.ipxe bin/ipxe.pxe bin-x86_64-efi/ipxe.efi
+
+# ---------------------------------------------------------------------------
+# Runtime image.
+# ---------------------------------------------------------------------------
 FROM python:3.12-slim-bookworm
 
 # bsdtar (libarchive-tools) and 7z extract kernel/initrd from ISO images without
@@ -23,6 +94,13 @@ RUN apt-get update \
 ARG WIMBOOT_VERSION=2.8.0
 RUN curl -fsSL -o /usr/local/share/wimboot \
         "https://github.com/ipxe/wimboot/releases/download/v${WIMBOOT_VERSION}/wimboot"
+
+# iPXE binaries from the build stage. Staged into TFTP_DIR at startup
+# (services.bootstrap), where the host's DHCP/TFTP service picks them up. Served
+# as undionly.kpxe so dnsmasq's pxe-service filename matches Beacon's; the bytes
+# are the native-driver ipxe.pxe build (see the build stage).
+COPY --from=ipxe /ipxe/src/bin/ipxe.pxe            /usr/local/share/ipxe/undionly.kpxe
+COPY --from=ipxe /ipxe/src/bin-x86_64-efi/ipxe.efi /usr/local/share/ipxe/ipxe.efi
 
 WORKDIR /app
 

@@ -1,15 +1,12 @@
-# Lantern PXE — web layer only (stage 1: see docs/design.md for the rest of
-# the topology, which isn't built yet).
+# Lantern PXE — web layer. DHCP/TFTP runs on the host, not here: install it
+# with `sudo host/install.sh "$PWD/data"` once this container has started (see
+# README.md). HTTP boot root, NFS and SMB aren't built yet (docs/design.md).
 #
 # Builds and runs the FastAPI management UI + API in a rootless Podman
 # container: no privileged flags, no host networking, no socket mounts.
 #
 #   1. Copy .env.example to .env and edit it.
 #   2. podman compose up -d --build   (or: docker compose up -d --build)
-#
-# There is no DHCP/TFTP, HTTP boot root, NFS, or SMB service here yet — those
-# are the parts of the topology docs/design.md leaves open. This brings up
-# just the admin console so it can be built and tested standalone.
 
 services:
   web:
@@ -24,16 +21,17 @@ services:
     environment:
       DATA_DIR: /data
       BOOTROOT_DIR: /bootroot
-      TFTP_DIR: /tftp
+      # The generated dnsmasq.conf and the iPXE binaries live under ./data so
+      # the host's DHCP/TFTP service can read them (host/install.sh).
+      TFTP_DIR: /data/tftp
       IMAGE_DIR: /images
-      DNSMASQ_DIR: /dnsmasq
+      DNSMASQ_DIR: /data/dnsmasq
       NFS_DIR: /nfs
       SMB_DIR: /smb
     volumes:
       - ./data:/data:Z
       - bootroot:/bootroot
       - ${IMAGE_PATH:-./data/images}:/images:Z
-      - dnsmasqconf:/dnsmasq
       - nfsroot:/nfs
       - smbroot:/smb
       - ./data/drivers:/smb/drivers:Z
@@ -44,4 +42,3 @@ volumes:
   bootroot:
   nfsroot:
   smbroot:
-  dnsmasqconf:

@@ -20,12 +20,16 @@ staging. `podman compose up -d --build` (or `docker compose`) brings up just
 that service; see [compose.yml](compose.yml) and
 [.env.example](.env.example).
 
+Stage 2 built: the host-level DHCP/TFTP service (`host/`). dnsmasq runs as a
+root systemd unit on the host, and a systemd path unit applies the web app's
+`dnsmasq.conf` whenever it changes, checking it against an allowlist first.
+Installed with `sudo host/install.sh <data dir>`. The design is in
+[docs/design.md](docs/design.md)'s "DHCP/TFTP" section.
+
 Not built yet, per the open questions in [docs/design.md](docs/design.md):
-the host-level DHCP/TFTP service and its privileged reload helper, the
-NFS/HTTP boot-root choice, and SMB placement. `services.dnsmasq.render()`
-writes `dnsmasq.conf` but nothing reloads it yet
-(`services.dnsmasq.trigger_reload()` is a stub); extraction stages files
-under `NFS_DIR`/`SMB_DIR` but nothing serves them yet.
+the NFS/HTTP boot-root choice (including the HTTP server that serves
+`boot.ipxe`) and SMB placement. Extraction stages files under
+`NFS_DIR`/`SMB_DIR`, but nothing serves them yet.
 
 Beacon's Docker-socket self-update feature was deliberately not ported — it
 isn't in design.md's "what carries over" list and conflicts with the

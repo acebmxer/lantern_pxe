@@ -1,0 +1,21 @@
+# Lantern PXE: proxyDHCP/DHCP + TFTP for PXE clients on the boot LAN.
+# Installed by host/install.sh. Runs on the host, not in a container, because a
+# rootless container can't reach the physical boot NIC (docs/design.md).
+# Its config is written only by lantern-apply.service, never by hand.
+
+[Unit]
+Description=Lantern PXE DHCP/TFTP (dnsmasq)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/lantern/dnsmasq.conf
+
+[Service]
+ExecStartPre=@DNSMASQ@ --test --conf-file=/etc/lantern/dnsmasq.conf
+# No log-facility in the config: dnsmasq logs to the journal, and
+# lantern-dnsmasq-log.service copies it to where the web app reads it.
+ExecStart=@DNSMASQ@ --keep-in-foreground --conf-file=/etc/lantern/dnsmasq.conf --pid-file=/run/dnsmasq-lantern.pid
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,9 @@
 
 Working notes from the decision to build this as a separate project
 rather than a Podman port of [Beacon](https://github.com/acebmxer/beacon_pxe).
-Nothing here is implemented yet — this is the topology to build against.
+This is the topology to build against. The web layer and the host-level
+DHCP/TFTP service are built; the NFS replacement and SMB placement are
+still open.
 
 ## Constraint
 
@@ -31,7 +33,7 @@ Podman flag.
 | DHCP/TFTP (dnsmasq) | containerized, host network, `NET_ADMIN` | **host-level systemd service**, not containerized |
 | NFS boot roots | containerized, `privileged: true`, host network | **replaced** — see options below |
 | SMB (Windows install media) | containerized, host network | evaluate: may work rootless via pasta/slirp4netns if ports 139/445 don't require true host-NIC binding; otherwise host-level like DHCP |
-| dnsmasq reload sidecar | containerized, mounts Docker socket | **N/A** — host service reloaded via systemd/sudo-scoped helper, not a socket-mounted sidecar |
+| dnsmasq reload sidecar | containerized, mounts Docker socket | **N/A** — a systemd path unit on the host notices the config change, validates it and restarts dnsmasq; nothing is mounted into the container |
 
 Rootless containers handle everything that doesn't need host root or
 host-NIC control. The two hard-blocked services move out of containers
@@ -39,15 +41,36 @@ entirely rather than being forced rootless.
 
 ### DHCP/TFTP
 
-Runs as a normal root systemd service on the host (e.g. `dnsmasq.service`,
-config-managed the same way Beacon's web app currently regenerates
-`dnsmasq.conf` — just writing to a host path and triggering a systemd
-reload instead of restarting a container). The rootless web container
-needs a narrow, explicit way to trigger that reload without holding host
-root itself — likely a small privileged helper invoked via a tightly
-scoped sudoers rule or a systemd socket-activated unit, not a general
-Docker/Podman-socket mount. This needs its own write-up before
-implementation.
+Decided and built (`host/`). dnsmasq runs as a root systemd service on the
+host (`lantern-dnsmasq.service`). The rootless web container still generates
+`dnsmasq.conf`, as Beacon's does. The difference is how that change reaches
+dnsmasq:
+
+- **The container's only interface is writing files.** It writes
+  `data/dnsmasq/dnsmasq.conf` and stages the iPXE binaries in `data/tftp/`.
+  It has no socket, no sudo rule and no command it can run on the host.
+- **A systemd path unit (`lantern-apply.path`) watches those files** and
+  starts `lantern-host apply` as root. We chose this over a socket-activated
+  unit, which would have given faster feedback to the UI but a live channel
+  from the container to a root process. We also chose it over a sudoers rule,
+  which a rootless container can't reach anyway.
+- **`apply` treats everything under `data/` as hostile.** It opens files one
+  component at a time without following symlinks, reads only regular files,
+  caps sizes, and writes through temp-file-and-rename. It accepts only the
+  dnsmasq directives the web app actually emits (`ALLOWED_DIRECTIVES` in
+  `host/lantern_host.py`). Anything naming a file or running a program
+  (`dhcp-script`, `conf-file`, `log-facility`, `tftp-root`, ...) is refused.
+  That list is the answer to "is this just root access with extra steps":
+  the container can change DHCP behaviour, not host files or code. The host
+  adds `tftp-root` itself, runs `dnsmasq --test` on the result, installs it
+  as `/etc/lantern/dnsmasq.conf` and restarts dnsmasq. It then writes the
+  outcome to `data/dnsmasq/apply-status.json`, which the Settings page shows.
+- **Host-side paths are chosen for SELinux.** The TFTP root is
+  `/var/lib/tftpboot/lantern` (labelled `tftpdir_rw_t`, which `dnsmasq_t`
+  can read). No file type is both writable by `dnsmasq_t` and readable by
+  `container_t`, so dnsmasq logs to the journal. `lantern-dnsmasq-log.service`
+  then appends those lines to `data/dnsmasq/dnsmasq.log` for the dashboard's
+  recent-clients view, using the same no-symlink rules.
 
 ### NFS replacement
 
@@ -89,7 +112,6 @@ instead.
 
 - Actual implementation of any service.
 - Final choice between the NFS-replacement options above.
-- Design of the privileged-reload helper for DHCP config changes.
 - Whether SMB can stay containerized or has to move to the host like
   DHCP — needs testing against real rootless Podman network modes
   (pasta vs. slirp4netns vs. host) before deciding.
@@ -100,8 +122,6 @@ instead.
   (69, 139, 445, 2049) in a way that's actually reachable from the real
   boot LAN, or does everything below 1024 force a host-level service
   the same way DHCP does?
-- Does the reload-helper approach (sudoers-scoped or socket-activated)
-  hold up security-wise, or is it just root access with extra steps?
 - XCP-NG and Windows both currently lean on NFS/SMB semantics pretty
   directly — how much of their boot flow breaks if NFS goes away
   entirely in favor of HTTP+overlay?

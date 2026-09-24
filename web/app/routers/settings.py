@@ -34,6 +34,7 @@ def settings_page(request: Request, user: User = Depends(require_admin),
                   db: Session = Depends(get_db)):
     return render(request, db, "settings.html",
                   active="settings", settings=all_settings(db), saved=False,
+                  apply_status=dnsmasq.apply_status(),
                   restore_notice=restore_svc.current_notice(db))
 
 
@@ -55,8 +56,8 @@ async def settings_save(request: Request, user: User = Depends(require_admin),
     for key in BOOL_KEYS:
         set_setting(db, key, "1" if key in form else "0")
 
-    # Regenerate boot configs. dnsmasq.conf is written but not yet reloaded
-    # automatically — see services.dnsmasq.trigger_reload().
+    # Regenerate boot configs. Writing dnsmasq.conf is all it takes: the host
+    # applies it on its own (see services.dnsmasq).
     dnsmasq.render(db)
     ipxe.render(db)
     # XCP-NG GRUB chainloaders bake in the server IP, so rebuild them in case it
@@ -66,6 +67,7 @@ async def settings_save(request: Request, user: User = Depends(require_admin),
     image_svc.rebuild_windows_setup_all(db)
     return render(request, db, "settings.html",
                   active="settings", settings=all_settings(db), saved=True,
+                  apply_status=dnsmasq.apply_status(),
                   restore_notice=restore_svc.current_notice(db))
 
 
