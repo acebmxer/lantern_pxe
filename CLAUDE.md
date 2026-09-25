@@ -41,10 +41,34 @@ second container out under SELinux enforcing. The host still has to allow
 binding port 80 as non-root (`net.ipv4.ip_unprivileged_port_start`); see
 [README.md](README.md).
 
-Not built yet, per the open questions in [docs/design.md](docs/design.md):
-NFS (needed for Debian/Ubuntu live images' netboot root) and SMB placement
-(needed for Windows install media once WinPE starts). Extraction stages
-files under `NFS_DIR`/`SMB_DIR`, but nothing serves them yet.
+NFS decided and built: no NFS server exists anywhere in this project (kernel
+NFS is root-only, so it was never going to be an option here). Debian/Ubuntu
+live images now netboot over plain HTTP instead — Debian (live-boot) via
+`fetch=`, which pulls just the squashfs; Ubuntu (casper) via `url=`, which
+pulls the whole ISO, since casper has no shipped squashfs-only fetch. See
+[docs/design.md](docs/design.md)'s "NFS replacement" section.
+
+Stage 4 built: the SMB share (`smb/`) for Windows install media, a rootless
+container running `smbd` directly (root inside its own container/user
+namespace, not the host's — see `smb/Containerfile`), reachable via pasta the
+same way `httpboot`'s port 80 already is. One guest-only share, `[install]`,
+matches the `net use ... /user:guest ""` WinPE runs; a second, `[capture]`,
+is opt-in via `ENABLE_DIAG_CAPTURE`. `force user`/`force group` looked like
+the right way to pin guest file ops to the web app's uid but broke writes
+(smbd's own POSIX ACL check denied them) — `guest account = lantern` alone
+does the same job without that bug; see
+[docs/design.md](docs/design.md)'s "SMB" section for the detail. Confirmed
+working end to end, including a real Windows PXE client reaching the share
+and launching Setup.
+
+A second bug is what actually made Windows look like it was crashing:
+`_extract_tree_7z` left every extracted file at plain `644`, no execute bit,
+so `net use`/reading/copying all worked but *launching* `setup.exe` over SMB
+needed `FILE_EXECUTE`, which Samba ties to the Unix execute bit — instant
+"Access is denied", the script exited normally, and WinPE's default
+behaviour on a normal shell exit is to reboot. Looked exactly like a VM
+crash from the console. Fixed with `chmod -R a+rwx` on the extracted tree
+right after unpacking; see [docs/design.md](docs/design.md)'s "SMB" section.
 
 Beacon's Docker-socket self-update feature was deliberately not ported — it
 isn't in design.md's "what carries over" list and conflicts with the

@@ -1,7 +1,7 @@
-# Lantern PXE — web layer + HTTP boot root. DHCP/TFTP runs on the host, not
-# here: install it with `sudo host/install.sh "$PWD/data"` once this container
-# has started (see README.md). NFS and SMB boot paths aren't built yet
-# (docs/design.md).
+# Lantern PXE — web layer, HTTP boot root, and the Windows install SMB share.
+# DHCP/TFTP runs on the host, not here: install it with
+# `sudo host/install.sh "$PWD/data"` once this container has started (see
+# README.md).
 #
 # Builds and runs the FastAPI management UI + API, and the nginx HTTP boot
 # root, as rootless Podman containers: no privileged flags, no host
@@ -28,19 +28,25 @@ services:
       TFTP_DIR: /data/tftp
       IMAGE_DIR: /images
       DNSMASQ_DIR: /data/dnsmasq
-      NFS_DIR: /nfs
       SMB_DIR: /smb
     volumes:
-      - ./data:/data:Z
+      # :z (shared), not :Z (private) -- the smb container below also reads
+      # and writes paths under this tree (data/drivers, data/capture), and a
+      # :Z here recursively re-claims the whole tree as web's own private
+      # SELinux category on every web restart, silently locking smb back out
+      # of subpaths it was separately given :z on (verified: this happened
+      # for real, twice, after rebuilding web for an unrelated code change).
+      - ./data:/data:z
       # :z (shared), not :Z (private) -- the httpboot container below reads
-      # this same volume. :Z would give each container its own SELinux MCS
-      # category and lock the other out (SELinux enforcing: verified this
-      # fails with "Permission denied" on files the other container wrote).
+      # this same bootroot and images volumes. :Z would give each container
+      # its own SELinux MCS category and lock the other out (SELinux
+      # enforcing: verified this fails with "Permission denied" on files the
+      # other container wrote).
       - bootroot:/bootroot:z
-      - ${IMAGE_PATH:-./data/images}:/images:Z
-      - nfsroot:/nfs
-      - smbroot:/smb
-      - ./data/drivers:/smb/drivers:Z
+      - ${IMAGE_PATH:-./data/images}:/images:z
+      # :z (shared) -- the smb container below also reads these two.
+      - smbroot:/smb:z
+      - ./data/drivers:/smb/drivers:z
     ports:
       - "${WEB_PORT:-8080}:8080"
 
@@ -65,6 +71,11 @@ services:
       - /tmp
     volumes:
       - bootroot:/bootroot:ro,z
+      # Raw uploaded ISOs, read-only -- casper's whole-ISO url= boot method
+      # and Fedora/RHEL's inst.repo= both fetch the ISO itself over HTTP
+      # (services/images.py's iso_url), so it has to be reachable here too,
+      # not just inside the web container that uploads/processes it.
+      - ${IMAGE_PATH:-./data/images}:/images:ro,z
       - ./httpboot/nginx.conf:/etc/nginx/conf.d/default.conf:ro,Z
       - ./httpboot/docker-entrypoint.d/40-resolver.sh:/docker-entrypoint.d/40-resolver.sh:ro,Z
     ports:
@@ -78,7 +89,41 @@ services:
     depends_on:
       - web
 
+  smb:
+    # Windows install media, guest-only, no auth -- matches the
+    # `net use ... /user:guest ""` WinPE runs (services/images.py). Runs as
+    # root *inside its own container/user namespace* (see smb/Containerfile's
+    # top comment for why, and why that's still rootless from the host's
+    # side); everything else here follows the same no-privileged-flags rule
+    # as the other services.
+    build:
+      context: ./smb
+      dockerfile: Containerfile
+    container_name: lantern-smb
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      ENABLE_DIAG_CAPTURE: ${ENABLE_DIAG_CAPTURE:-false}
+    volumes:
+      - smbroot:/install:ro,z
+      - ./data/drivers:/install/drivers:ro,z
+      - ./data/capture:/capture:z
+    ports:
+      # WinPE's `net use \\<server>\install\...` (services/images.py) is a
+      # raw IP, not a NetBIOS name, so it goes straight for direct-hosted SMB
+      # on 445 -- no nmbd/port 139 needed. Fixed at 445, not a *_PORT env var,
+      # for the same reason httpboot's 80 is fixed: the generated
+      # winpeshl.ini bakes in the plain `\\<server>\install` UNC path with no
+      # port, so changing this would silently break every Windows image
+      # already processed. Same rootless-port-binding requirement as
+      # httpboot's 80 (README.md) -- 445 and 139 are both above the port-80
+      # floor that setting already lowers, so no extra sysctl is needed once
+      # that one's in place.
+      - "445:445"
+    depends_on:
+      - web
+
 volumes:
   bootroot:
-  nfsroot:
   smbroot:

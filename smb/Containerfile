@@ -1,0 +1,27 @@
+# Rootless Podman, but NOT the "runs as uid 1000 inside too" pattern the web
+# and httpboot images use (see their Containerfile/compose.yml comments) --
+# smbd needs to bind port 445 (<1024) and setuid()/setgroups() to impersonate
+# the forced guest user on every connection, both of which need it to be
+# root *inside its own container/user namespace*. That's still fully rootless
+# from the host's point of view: Podman maps this container's root to an
+# unprivileged host uid via /etc/subuid, the same as every other service
+# here -- it is never real host root, which is the thing docs/design.md's
+# Constraint section actually rules out.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends samba \
+    && rm -rf /var/lib/apt/lists/*
+
+# Matches the uid the web app's container runs as (web/Containerfile), so
+# `force user`/`force group` in smb.conf land guest file ops with the same
+# ownership already on the shared smbroot volume and data/capture bind mount.
+RUN useradd --create-home --uid 1000 lantern
+
+COPY smb.conf /etc/samba/smb.conf.template
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 445
+
+ENTRYPOINT ["/entrypoint.sh"]

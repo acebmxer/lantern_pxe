@@ -21,10 +21,6 @@ BOOTROOT_DIR = _path("BOOTROOT_DIR", "./bootroot")
 TFTP_DIR = _path("TFTP_DIR", "./tftp")
 IMAGE_DIR = _path("IMAGE_DIR", "./data/images")
 DNSMASQ_DIR = _path("DNSMASQ_DIR", "./dnsmasq")
-# Live filesystems extracted from ISOs. Whether these end up served over NFS,
-# nfs-ganesha, or HTTP+overlay is still open (see docs/design.md's "NFS
-# replacement" section) — extraction just stages the files locally either way.
-NFS_DIR = _path("NFS_DIR", "./data/nfs")
 # Unpacked Windows install media. Served over SMB so WinPE can run setup.exe
 # from it (iPXE can't sanhook the ISO under UEFI); whether SMB stays
 # containerized or moves to the host like DHCP is also open (docs/design.md).

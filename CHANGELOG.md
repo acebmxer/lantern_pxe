@@ -10,8 +10,102 @@ observable are omitted.
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows Setup wouldn't launch over the SMB install share, and it looked
+  exactly like the VM itself crashing rather than a script failure.
+  `_extract_tree_7z` (the ISO unpack into `SMB_DIR`) leaves every extracted
+  file at the plain `644` 7z gives them, with no Unix execute bit. `net use`,
+  `xcopy`-ing drop-in drivers, and plain reads over the share all worked fine
+  — those only need `FILE_READ_DATA`. Actually launching `setup.exe` needs
+  the SMB `FILE_EXECUTE` right, which Samba's POSIX permission check ties to
+  the Unix execute bit, so it returned instantly ("Access is denied",
+  errorlevel 5) before showing any UI. WinPE's own default behaviour when its
+  shell (`lantern-setup.cmd`, launched via `winpeshl.ini`) exits is to reboot
+  the machine, so a script failing in under a second looked, from the
+  console, exactly like the VM resetting mid-boot. Found only after
+  `lantern-setup.cmd` was given a progress log that writes to the (opt-in)
+  `[capture]` share on every step, specifically because it survives a VM
+  reset when nothing else does — the log showed Setup launching and
+  returning in the same millisecond, with "Access is denied" as its own
+  captured console output. Fixed with `chmod -R a+rwx` on the whole extracted
+  tree right after unpacking; the SMB share's own `read only = yes` is what
+  actually enforces read-only for guests, not the Unix write bit, so this
+  doesn't loosen anything a guest can do over the wire.
+- Debian and Ubuntu live images now actually boot over PXE. `_netboot_plan()`
+  previously pointed them at `netboot=nfs nfsroot=...`, but no NFS server was
+  ever built anywhere in this project — nothing wrote to or served the
+  `nfsroot` volume — so every Debian/Ubuntu client hung with `connect:
+  Connection refused` trying to mount a share that didn't exist. Both
+  families now boot over the existing rootless `httpboot` HTTP root instead,
+  with no NFS anywhere in the picture: kernel NFS needs root and was never
+  going to be an option here (docs/design.md's Constraint section). Debian
+  (live-boot) uses `fetch=URL` (verified against live-boot(7)), which
+  downloads just `filesystem.squashfs` into a tmpfs. Ubuntu (casper) uses
+  `url=`/`netboot=url` instead: casper has no shipped equivalent to
+  live-boot's squashfs-only fetch — that exists only as an unmerged
+  community patch (Launchpad #1660206) — so it downloads and loopback-mounts
+  the whole ISO, needing more client RAM for the same content than Debian
+  does. The now fully unused `NFS_DIR`/`nfsroot` volume, its `needs_nfs`
+  extraction branch, and the iPXE `server-ip` variable it was the only
+  consumer of have all been removed.
+  While building this, found and fixed a second, pre-existing bug it would
+  otherwise have inherited: `_netboot_plan()`'s `iso_url` (used by both
+  Ubuntu's new `url=` and Fedora/RHEL's existing `inst.repo=`) points at
+  `${boot-url}/images/<filename>`, but the `httpboot` container never had the
+  images volume mounted, so that URL 404'd for every image that used it —
+  Fedora/RHEL's `inst.repo=` install path was silently broken from the day it
+  shipped. `httpboot` now mounts the images volume read-only and serves it at
+  `/images/`.
+
 ### Added
 
+- SMB share (`smb/`) for Windows install media: a containerized, rootless
+  Samba server exporting a guest-only, unauthenticated `[install]` share that
+  matches the `net use ... /user:guest ""` WinPE already runs
+  (`services/images.py::_lantern_setup_cmd`) — no domain, no real accounts,
+  no winbind. `smbd` runs as root *inside its own container/user namespace*
+  (not the host's — see `smb/Containerfile`'s top comment for why that's
+  still rootless from the host's side) so it can bind port 445 directly and
+  `setuid()`/`setgroups()` to the guest account per connection; pasta forwards
+  real connections to it the same way it already does for `httpboot`'s port
+  80. A second share, `[capture]`, is appended by `smb/entrypoint.sh` only
+  when `ENABLE_DIAG_CAPTURE=true` (`.env.example`) — previously a documented
+  but entirely unenforced setting, since nothing served SMB at all to make
+  "opt-in" mean anything.
+  While building this, found and fixed a real bug in the approach, not the
+  destination: `force user`/`force group` looked like the direct way to pin
+  every guest file operation to the uid the web app and its volumes already
+  use (1000), but combined with `map to guest = bad user` it left smbd's own
+  POSIX ACL check (`check_parent_access_fsp`) denying writes to a directory
+  the mapped uid plainly owned 0755 on — some interaction between the two
+  mapping layers smbd doesn't handle cleanly. Verified with `log level = 10`
+  that the denial was internal to smbd, not a kernel/SELinux permission
+  problem (a plain shell as the same uid could write the same path fine).
+  `guest account = lantern` alone pins the same uid without hitting this, and
+  is what `smb/smb.conf` uses.
+  A second bug, found from a real report rather than testing: the new `smb`
+  container's `./data/drivers` and `./data/capture` mounts used `:Z`
+  (private SELinux label), the same path the `web` container already mounts
+  at `/smb/drivers` — two containers privately labelling the same host path
+  is exactly the lockout `compose.yml`'s own `bootroot` comment already warns
+  about, and it broke the Drivers page (`PermissionError: [Errno 13]
+  Permission denied: '/smb/drivers'`) the moment `smb` started. Both
+  containers' mounts of these two paths are now `:z` (shared), matching
+  `bootroot`/`smbroot`/the images volume.
+  The same lockout recurred a second way from a path that wasn't obvious
+  until it happened twice: `web`'s own top-level `./data:/data:Z` mount
+  recursively relabels the *whole* `./data` tree as `web`'s private category
+  on every `web` restart, silently re-breaking `smb`'s separately-`:z`-labelled
+  access to `data/drivers`/`data/capture` underneath it — verified by watching
+  a diagnostic log `smb` should have been able to write suddenly go missing
+  again right after an unrelated `web` rebuild. `web`'s `./data` mount is now
+  `:z` too.
+  Verified end to end with `smbclient` against the published port (guest
+  read on `[install]`, including `setup.exe` and the drivers folder; guest
+  write on `[capture]` once enabled; `[capture]` absent when the setting is
+  off), and with a real Windows PXE client reaching the share and launching
+  Setup.
 - HTTP boot root (`httpboot/`): a containerized, rootless nginx that serves
   `BOOTROOT_DIR` (boot.ipxe, extracted kernels/initrds, squashfs images,
   wimboot, the XCP-NG GRUB chainload) to PXE clients and reverse-proxies
@@ -19,9 +113,9 @@ observable are omitted.
   it already generated. This unblocks the boot flow for every image family
   that only needs HTTP: Fedora/Arch-family live images, XCP-NG via its GRUB
   chainload, and WinPE for Windows (the Windows install itself still needs
-  the not-yet-built SMB share once WinPE starts, and Debian/Ubuntu live
-  images still need NFS). Uses `nginxinc/nginx-unprivileged` running as the
-  same uid the web app writes as (1000), not the ordinary `nginx` image:
+  the not-yet-built SMB share once WinPE starts). Uses
+  `nginxinc/nginx-unprivileged` running as the same uid the web app writes
+  as (1000), not the ordinary `nginx` image:
   nginx's usual root-binds-80-then-drops-to-a-user pattern needs
   `CAP_NET_BIND_SERVICE`, which rootless Podman won't grant, and testing
   found that a fresh named volume shared between two containers running as
@@ -88,7 +182,7 @@ observable are omitted.
   While testing the HTTP boot root above end to end, found and fixed a real
   bug in `process_image()`: only `subprocess.CalledProcessError` from the
   extraction steps was caught, so an unrelated failure (reproduced here with
-  a `PermissionError` from a misconfigured `NFS_DIR` mount) propagated out of
+  a `PermissionError` from a misconfigured `SMB_DIR` mount) propagated out of
   the background task uncaught, leaving the image stuck on `processing`
   forever with no message and, unlike `error`/`pending`/`needs_reprocess`, no
   Retry button in the UI (`templates/images.html`) to get it out of that

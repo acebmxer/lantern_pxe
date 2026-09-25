@@ -7,24 +7,25 @@ A self-hosted PXE/iPXE boot server with a login-protected web console —
 same goal and user-facing experience as [Beacon](https://github.com/acebmxer/beacon_pxe),
 built around Podman's rootless model instead of Docker's root-daemon one.
 
-**Status: stage 3.** The web management layer, the host-level DHCP/TFTP
-service, and the containerized HTTP boot root are built, so PXE clients can
-load iPXE, fetch the boot menu, and boot anything the menu serves purely over
-HTTP (Fedora/Arch-family live images, XCP-NG via its GRUB chainload, and
-WinPE for Windows). The NFS and SMB boot paths still aren't built: Debian/
-Ubuntu live images (which netboot over NFS) won't find a root filesystem, and
-a Windows install can't reach `install.wim` (served over SMB) once WinPE
-starts. See [docs/design.md](docs/design.md) for the service topology and
-what's being reused vs. rebuilt.
+**Status: stage 4.** The web management layer, the host-level DHCP/TFTP
+service, the containerized HTTP boot root, and the containerized Windows
+install SMB share are all built. PXE clients can load iPXE, fetch the boot
+menu, and boot every image family the menu serves: Fedora/Arch-family and
+Debian/Ubuntu live images and XCP-NG via its GRUB chainload purely over HTTP,
+and Windows via WinPE (wimboot/HTTP) followed by a guest-only SMB share for
+the install media itself. See [docs/design.md](docs/design.md) for the
+service topology and what's being reused vs. rebuilt.
 
 ## Running it
 
-### 1. Web layer + HTTP boot root (rootless containers)
+### 1. Web layer, HTTP boot root, and SMB share (rootless containers)
 
-Rootless containers can't bind a port below 1024 by default, and PXE clients
-reach the boot root on plain HTTP with no port in the URL, so port 80 has to
-be free for the `httpboot` container to bind on the host side. Either allow
-rootless port binding down to 80:
+Rootless containers can't bind a port below 1024 by default. PXE clients
+reach the HTTP boot root on plain HTTP with no port in the URL and WinPE
+reaches the SMB share on the standard port 445, so both need to be free for
+the `httpboot` and `smb` containers to bind on the host side. Either allow
+rootless port binding down to 80 (this one setting covers 445 too, since it
+lowers the floor, not just port 80 itself):
 
 ```
 sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80    # or add to /etc/sysctl.d
@@ -33,7 +34,9 @@ sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80    # or add to /etc/sysctl
 or edit the `"80:8080"` line under the `httpboot` service in `compose.yml` to
 a port your setup can bind, and change every `http://<server_ip>` the iPXE
 menu assumes back to `http://<server_ip>:<port>` (`SERVER_IP` in `.env` stays
-just the IP; there's no separate port setting yet).
+just the IP; there's no separate port setting yet). The `smb` service's
+`"445:445"` line has no equivalent workaround — WinPE connects to port 445
+with no way to override it, so that one has to stay free.
 
 ```
 cp .env.example .env   # edit ADMIN_PASSWORD, SERVER_IP, etc.
@@ -41,9 +44,11 @@ podman compose up -d --build   # or: docker compose up -d --build
 ```
 
 Brings up the management console at `http://localhost:8080` (auth, users,
-settings, image upload/processing, driver staging) and the HTTP boot root
-PXE clients fetch `boot.ipxe`, kernels/initrds and squashfs images from, on
-port 80.
+settings, image upload/processing, driver staging), the HTTP boot root PXE
+clients fetch `boot.ipxe`, kernels/initrds and squashfs images from (port 80),
+and the guest-only SMB share (port 445) WinPE mounts to run Windows Setup.
+If a firewall is running, also allow TCP 445 on the boot interface for the
+SMB share.
 
 ### 2. DHCP/TFTP (host service)
 

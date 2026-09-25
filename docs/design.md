@@ -3,8 +3,8 @@
 Working notes from the decision to build this as a separate project
 rather than a Podman port of [Beacon](https://github.com/acebmxer/beacon_pxe).
 This is the topology to build against. The web layer, the host-level
-DHCP/TFTP service, and the containerized HTTP boot root are built; the NFS
-replacement and SMB placement are still open.
+DHCP/TFTP service, the containerized HTTP boot root, the NFS replacement, and
+SMB placement are all decided and built (below).
 
 ## Constraint
 
@@ -31,8 +31,8 @@ Podman flag.
 | Boot menu (iPXE) generation | containerized | containerized, rootless |
 | HTTP boot root (nginx) | containerized | containerized, rootless |
 | DHCP/TFTP (dnsmasq) | containerized, host network, `NET_ADMIN` | **host-level systemd service**, not containerized |
-| NFS boot roots | containerized, `privileged: true`, host network | **replaced** — see options below |
-| SMB (Windows install media) | containerized, host network | evaluate: may work rootless via pasta/slirp4netns if ports 139/445 don't require true host-NIC binding; otherwise host-level like DHCP |
+| NFS boot roots | containerized, `privileged: true`, host network | **replaced** — plain HTTP, see below |
+| SMB (Windows install media) | containerized, host network | **decided** — containerized, rootless via pasta, see below |
 | dnsmasq reload sidecar | containerized, mounts Docker socket | **N/A** — a systemd path unit on the host notices the config change, validates it and restarts dnsmasq; nothing is mounted into the container |
 
 Rootless containers handle everything that doesn't need host root or
@@ -74,21 +74,82 @@ dnsmasq:
 
 ### NFS replacement
 
-Options to evaluate, not yet decided:
+Decided: **HTTP boot instead of NFS root**, option 1 of the three originally
+considered (userspace NFS via nfs-ganesha, and overlay/squashfs-over-HTTP,
+were not pursued once this worked). No NFS server exists anywhere in this
+project's topology, containerized or host-level — kernel NFS is root-only
+with no rootless path (see Constraint above), so it was never going to be an
+option for a project built specifically to avoid needing root for this class
+of service.
 
-1. **HTTP boot instead of NFS root** — many distros support HTTP as a
-   live-root/boot source; would drop the NFS dependency entirely for
-   those cases.
-2. **Userspace NFS (nfs-ganesha)** — can run without the kernel module,
-   potentially rootless or with far fewer capabilities than kernel NFS.
-3. **Overlay/squashfs served over HTTP** — reframes "live filesystem
-   over NFS" as "boot image over HTTP + overlay", avoiding NFS as a
-   protocol altogether.
+Every non-Windows, non-XCP-NG family now nets boot purely over the existing
+rootless `httpboot` nginx container (`services/images.py::_netboot_plan`):
 
-Whichever is chosen has to work for every OS family Beacon currently
-supports (Linux live boot, Windows via WinPE/SMB, XCP-NG) — this is
-probably the single biggest open question for the project and likely
-determines how much of the client-boot experience can stay identical.
+- **Fedora/Arch-family live images** already streamed their squashfs over
+  HTTP; unchanged.
+- **Debian** (live-boot) uses live-boot's own `fetch=URL` boot parameter,
+  which downloads just `filesystem.squashfs` into a tmpfs — verified against
+  live-boot(7). No NFS, no whole-ISO download.
+- **Ubuntu** (casper) uses casper's own `url=`/`netboot=url` method instead,
+  which downloads and loopback-mounts the *whole ISO*. Casper has no shipped
+  equivalent to live-boot's squashfs-only `fetch=` — that exists only as an
+  unmerged community patch (Launchpad #1660206) — so Ubuntu clients need more
+  RAM for the same content than Debian clients do. If that turns out to be a
+  real problem, the fix is either the LP #1660206 patch baked into a custom
+  casper initrd, or nfs-ganesha for this one family specifically — not
+  revisited generally, since HTTP already works everywhere else.
+- Both methods copy the whole file into client RAM before mounting it, so
+  low-RAM clients are the risk to watch for, the same tradeoff the old
+  `url=`/`fetch=` methods were originally dropped for. Chosen anyway here
+  because staying rootless was the higher priority.
+
+### SMB
+
+Decided: **rootless container via pasta**, the first option in the open
+question this section used to pose. `smbd` binds port 445 directly (it can,
+inside its own container/user namespace — see `smb/Containerfile`'s top
+comment for why that's still rootless from the host's side), and pasta
+forwards real connections to it correctly, the same mechanism already proven
+for `httpboot`'s port 80 — confirmed both with `smbclient` against the
+published port and with a real Windows PXE client reaching the share and
+running Setup. Host-level Samba (the DHCP/TFTP pattern) was never needed.
+
+The `smb` container (`smb/`) exports one guest-only, unauthenticated share,
+`[install]`, matching the `net use ... /user:guest ""` WinPE runs
+(`services/images.py::_lantern_setup_cmd`) — no domain, no real accounts, no
+winbind. A second share, `[capture]`, is appended by `smb/entrypoint.sh` only
+when `ENABLE_DIAG_CAPTURE=true` (`.env.example`), matching the opt-in,
+unauthenticated-writable-share design that setting already implied before
+anything actually served it.
+
+One real bug surfaced building this, worth recording since it's a Samba trap
+rather than anything rootless-specific: `force user`/`force group` looked
+like the obvious way to pin every guest file operation to the uid the web app
+and its volumes already use (1000). Combined with `map to guest = bad user`,
+it instead left smbd's own POSIX ACL check (`check_parent_access_fsp`)
+denying writes to a directory the mapped uid plainly owned 0755 on —
+some interaction between force-mapping and an already-guest-mapped session
+that smbd doesn't handle cleanly. `guest account = lantern` alone (no
+`force user`/`force group`) achieves the same uid pinning and doesn't hit
+this; that's what `smb/smb.conf` uses.
+
+A second, unrelated bug is what actually made "Windows won't boot" look like
+a VM crash: `_extract_tree_7z` (the Windows ISO unpack into `SMB_DIR`) left
+every extracted file at the plain `644` 7z gives them, with no Unix execute
+bit. `net use`, `xcopy`-ing drop-in drivers, and reading files over the share
+all worked fine — those only need `FILE_READ_DATA`. Actually *launching*
+`setup.exe` over SMB needs the `FILE_EXECUTE` right, which Samba's POSIX
+permission check ties to the Unix execute bit, so it failed instantly
+("Access is denied", errorlevel 5) before showing any UI. WinPE's own default
+behavior when its shell (`lantern-setup.cmd`, via `winpeshl.ini`) exits is to
+reboot the machine — so a script failing in under a second looked, on
+screen, exactly like the VM crashing partway through boot. Found by adding a
+progress log that `lantern-setup.cmd` now always writes to the (opt-in)
+`[capture]` share on every step, specifically because it survives a VM reset
+even when nothing else does. Fixed by `chmod -R a+rwx` on the whole extracted
+tree right after unpacking — the SMB share's own `read only = yes` is what
+actually enforces read-only for guests, not the Unix write bit, so this
+doesn't loosen anything a guest can do over the wire.
 
 ## What carries over from Beacon
 
@@ -111,17 +172,3 @@ instead.
 ## Explicitly out of scope for this doc
 
 - Actual implementation of any service.
-- Final choice between the NFS-replacement options above.
-- Whether SMB can stay containerized or has to move to the host like
-  DHCP — needs testing against real rootless Podman network modes
-  (pasta vs. slirp4netns vs. host) before deciding.
-
-## Open questions
-
-- Can pasta (Podman's default rootless network backend) bind low ports
-  (69, 139, 445, 2049) in a way that's actually reachable from the real
-  boot LAN, or does everything below 1024 force a host-level service
-  the same way DHCP does?
-- XCP-NG and Windows both currently lean on NFS/SMB semantics pretty
-  directly — how much of their boot flow breaks if NFS goes away
-  entirely in favor of HTTP+overlay?

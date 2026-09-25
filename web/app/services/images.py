@@ -189,6 +189,17 @@ def _extract_tree_7z(iso: Path, dest: Path) -> None:
         ["7z", "x", "-y", f"-o{dest}", str(iso)],
         check=True, capture_output=True, text=True,
     )
+    # 7z extracts everything mode 644/755-ish with no execute bit on plain
+    # files. Harmless for most of this tree, but WinPE launching setup.exe
+    # over the SMB share needs the FILE_EXECUTE right, which Samba's POSIX
+    # permission check ties to the Unix execute bit — without this, `net use`
+    # and reading/copying files (xcopy, drvload staging) all work fine, but
+    # actually running setup.exe fails instantly with "Access is denied"
+    # (verified: errorlevel 5, before it ever gets a chance to show any UI).
+    # The SMB share is `read only = yes` regardless of these Unix bits, so
+    # making everything executable here doesn't loosen what a guest can
+    # actually do over the wire.
+    subprocess.run(["chmod", "-R", "a+rwx", str(dest)], check=True)
 
 
 def _detect_family(entries: list[str]) -> str:
@@ -510,6 +521,7 @@ def _lantern_setup_cmd(server_ip: str, image_id: int) -> str:
     host = server_ip or "%SERVER_IP%"
     share = rf"\\{host}\{_SMB_SHARE}\{image_id}"
     drivers = rf"\\{host}\{_SMB_SHARE}\{_SMB_DRIVERS}"
+    cap = rf"\\{host}\{_CAPTURE_SHARE}"
     lines = [
         "@echo off",
         # Hold a bugcheck's stop screen instead of letting WinPE auto-reboot, so
@@ -528,6 +540,18 @@ def _lantern_setup_cmd(server_ip: str, image_id: int) -> str:
         rf'for /r {_NIC_WINPE_DIR} %%f in (*.inf) do drvload "%%f"',
         ":nonicload",
         "wpeinit",
+        # Mounted here, before the retry loop, instead of only right before
+        # Setup — a debugging aid for a VM that resets partway through this
+        # script with no on-screen trace of how far it got: %tries% is
+        # appended on every loop iteration below, so the log on the host
+        # (data/capture, opt-in via ENABLE_DIAG_CAPTURE) shows the last
+        # iteration reached even when the crash itself is never seen.
+        rf'net use N: {cap} /user:guest "" >nul 2>&1',
+        rf"set PROGLOG=N:\img{image_id}-progress.log",
+        "if exist N:\\ ("
+        " echo ==== %date% %time% boot start ==== >> %PROGLOG%",
+        " ipconfig /all >> %PROGLOG% 2>&1",
+        ")",
         rf"echo Connecting to Lantern install share {share} ...",
         # Bounded retry (DHCP may not be ready on the first try). Show the real
         # `net use` error on each attempt instead of silently looping forever —
@@ -541,6 +565,7 @@ def _lantern_setup_cmd(server_ip: str, image_id: int) -> str:
         "set /a tries=0",
         ":retry",
         "set /a tries+=1",
+        "if exist N:\\ echo %date% %time% attempt %tries% >> %PROGLOG%",
         rf'net use Y: {share} /user:guest ""',
         "if exist Y:\\setup.exe goto run",
         "if %tries% geq 40 goto failed",
@@ -559,6 +584,9 @@ def _lantern_setup_cmd(server_ip: str, image_id: int) -> str:
         "cmd",
         "goto end",
         ":run",
+        # Confirms the mount itself succeeded rather than crashing during the
+        # net use call -- the previous checkpoint was "attempt %tries%" above.
+        "if exist N:\\ echo %date% %time% share mounted >> %PROGLOG%",
     ]
     if _WINPE_DIAGNOSTIC:
         # Don't launch Setup; show what WinPE can see on the share, then drop to
@@ -575,15 +603,17 @@ def _lantern_setup_cmd(server_ip: str, image_id: int) -> str:
     else:
         lines += _driver_lines(drivers)
         lines += [
-            # Pre-mount the diagnostics share and create this run's folder BEFORE
-            # Setup, so Setup can write its own logs there via /copylogs at the
-            # moment it fails — robust even when a failure reboots the machine
-            # (our post-exit :capture only runs if setup.exe returns to us). This
-            # is what makes a 0x80070035 ("network path not found") mid-install
-            # diagnosable: Setup re-copies its logs at failure time. The share is
-            # opt-in (ENABLE_DIAG_CAPTURE, off by default), so when it isn't
-            # exported the mount just fails and every capture step no-ops.
-            rf'net use N: \\{host}\{_CAPTURE_SHARE} /user:guest "" >nul 2>&1',
+            "if exist N:\\ echo %date% %time% driver staging done, "
+            "SETUPOPT=%SETUPOPT% >> %PROGLOG%",
+            # N: (the diagnostics share) is already mounted above, before the
+            # retry loop -- create this run's folder BEFORE Setup, so Setup can
+            # write its own logs there via /copylogs at the moment it fails —
+            # robust even when a failure reboots the machine (our post-exit
+            # :capture only runs if setup.exe returns to us). This is what makes
+            # a 0x80070035 ("network path not found") mid-install diagnosable:
+            # Setup re-copies its logs at failure time. The share is opt-in
+            # (ENABLE_DIAG_CAPTURE, off by default), so when it isn't exported
+            # N: was never mounted and every capture step below no-ops.
             rf"set CAPDIR=N:\img{image_id}-%RANDOM%",
             "set COPYLOGS=",
             "if exist N:\\ md %CAPDIR% >nul 2>&1",
@@ -611,7 +641,24 @@ def _lantern_setup_cmd(server_ip: str, image_id: int) -> str:
             # anything. Classic-flow failures are still collected by :capture,
             # which runs when Setup exits back to this script.
             'if not "%SETUPEXE%"=="Y:\\setup.exe" set COPYLOGS=',
-            "%SETUPEXE% %SETUPOPT% %COPYLOGS%",
+            "if not exist N:\\ goto skip_unattend_check",
+            rf"if exist {_UNATTEND_WINPE_PATH} (echo %date% %time% unattend "
+            r"file present >> %PROGLOG%) else (echo %date% %time% unattend "
+            r"file MISSING >> %PROGLOG%)",
+            ":skip_unattend_check",
+            "if exist N:\\ echo %date% %time% launching "
+            "%SETUPEXE% %SETUPOPT% %COPYLOGS% >> %PROGLOG%",
+            # Redirected into the log instead of shown on screen: Setup
+            # returns too fast (verified: same millisecond) to read anything
+            # it printed before the console flips away, but whatever it wrote
+            # to stdout/stderr survives here since %PROGLOG% is on the host.
+            "if exist N:\\ (",
+            "  %SETUPEXE% %SETUPOPT% %COPYLOGS% >> %PROGLOG% 2>&1",
+            ") else (",
+            "  %SETUPEXE% %SETUPOPT% %COPYLOGS%",
+            ")",
+            "if exist N:\\ echo %date% %time% setup.exe returned, "
+            "errorlevel %errorlevel% >> %PROGLOG%",
             # Setup returns here only when it exits WITHOUT rebooting — i.e. it
             # failed early. Add the WinPE-side logs Setup's /copylogs doesn't.
             "call :capture",
@@ -736,39 +783,49 @@ def _process_windows(db, img: Image, iso: Path, entries: list[str]) -> None:
 
 def _netboot_plan(
     entries: list[str], filename: str, image_id: int
-) -> tuple[bool, list[tuple[str, str]], str]:
+) -> tuple[list[tuple[str, str]], str]:
     """Decide how a live ISO should netboot.
 
-    Returns (needs_nfs, http_files, kernel cmdline):
-      - needs_nfs: unpack the whole ISO and export it over NFS.
-      - http_files: (iso_member, dest_relpath) pairs to extract into the image's
-        bootroot dir (os/<id>/) and stream over HTTP. dest_relpath keeps the
-        on-disc subpath where the bootloader expects it. Empty unless a single-
-        file HTTP root is used (Fedora 42+ live, Archiso); mutually exclusive
-        with needs_nfs.
+    Returns (http_files, kernel cmdline). http_files is a list of
+    (iso_member, dest_relpath) pairs to extract into the image's bootroot dir
+    (os/<id>/) and stream over HTTP; dest_relpath keeps the on-disc subpath
+    where the bootloader expects it. Empty when the client fetches the whole
+    ISO itself (casper's url=) rather than a single extracted file.
 
-    casper (Ubuntu) and live (Debian) images mount their squashfs over NFS so the
-    whole ISO never has to fit in client RAM — the old `url=`/`fetch=` methods
-    copied the full image into a tmpfs and fell over on anything but huge clients.
-    nfsroot points at this image's exported tree; ${server-ip} is set in boot.ipxe.
+    Every family here boots over plain HTTP — no NFS or SMB server exists on
+    the boot LAN, and per docs/design.md's Constraint section, kernel NFS is
+    root-only with no rootless path on any container runtime, so it's not
+    coming back as an option for this project.
+
+    live-boot (Debian) and casper (Ubuntu) need different HTTP methods because
+    only live-boot ships fetch=, which downloads just the squashfs:
+    - live-boot's `fetch=URL` (verified against live-boot(7)) downloads only
+      filesystem.squashfs into a tmpfs, not the whole ISO.
+    - casper has no shipped equivalent — squashfs-only fetch for casper is an
+      unmerged community patch (Launchpad #1660206), not something to rely on
+      for a real boot. Its own documented HTTP method, `url=`/`netboot=url`,
+      downloads and loopback-mounts the whole ISO instead, which needs more
+      client RAM than live-boot's squashfs-only fetch for the same content.
     Fedora/RHEL already stream their repo over HTTP, so they stay on HTTP.
     """
-    nfsroot = f"${{server-ip}}:/nfs/{image_id}"
     iso_url = f"${{boot-url}}/images/{filename}"
     base = f"${{boot-url}}/{EXTRACT_SUBDIR}/{image_id}"
     joined = " ".join(e.lower() for e in entries)
     if "casper/" in joined:  # Ubuntu / casper live
-        return True, [], f"boot=casper netboot=nfs nfsroot={nfsroot} ip=dhcp"
+        return [], f"boot=casper url={iso_url} netboot=url ip=dhcp"
     if "live/" in joined:    # Debian live
-        return True, [], f"boot=live netboot=nfs nfsroot={nfsroot} ip=dhcp"
+        squashfs = _match(entries, [r"live/filesystem\.squashfs"])
+        if squashfs:
+            return [(squashfs, "filesystem.squashfs")], (
+                f"boot=live fetch={base}/filesystem.squashfs ip=dhcp")
     if "images/pxeboot/" in joined:  # Fedora/RHEL family
-        return False, [], f"inst.repo={iso_url} ip=dhcp"
+        return [], f"inst.repo={iso_url} ip=dhcp"
     # Fedora 42+ live: dracut dmsquash-live root filesystem under LiveOS/. The
     # squashfs is extracted to the bootroot and streamed over HTTP — no NFS or
     # whole-ISO copy needed.
     squashfs = _match(entries, [r"liveos/squashfs.img"])
     if squashfs:
-        return False, [(squashfs, "squashfs.img")], (
+        return [(squashfs, "squashfs.img")], (
             f"root=live:{base}/squashfs.img rd.live.image ip=dhcp")
     # Archiso (Arch / EndeavourOS / CachyOS): the airootfs squashfs lives under
     # arch/<arch>/. archiso's initramfs fetches it (and verifies the .sha512)
@@ -793,10 +850,10 @@ def _netboot_plan(
         sha = _match(entries, [r"arch/[^/]+/airootfs.sha512"])
         if sha:
             files.append((sha, sha.lstrip("./")))
-        return False, files, (
+        return files, (
             f"archiso_http_srv={base}/ archisobasedir={basedir} "
             "BOOTIF=01-${net0/mac:hexhyp} ip=dhcp")
-    return False, [], "ip=dhcp"
+    return [], "ip=dhcp"
 
 
 def _clean_derived_data(image_id: int) -> None:
@@ -804,12 +861,11 @@ def _clean_derived_data(image_id: int) -> None:
 
     Called at the start of each (re)process so a run is always a clean slate: an
     image whose family or netboot method changed can't leave a stale boot.wim,
-    Xen kernel, or a multi-GB NFS/SMB tree from a previous run behind. The ISO
+    Xen kernel, or a multi-GB SMB tree from a previous run behind. The ISO
     itself lives in IMAGE_DIR and is preserved.
     """
     sid = str(image_id)
     shutil.rmtree(config.BOOTROOT_DIR / EXTRACT_SUBDIR / sid, ignore_errors=True)
-    shutil.rmtree(config.NFS_DIR / sid, ignore_errors=True)
     shutil.rmtree(config.SMB_DIR / sid, ignore_errors=True)
 
 
@@ -829,7 +885,7 @@ def process_image(image_id: int) -> None:
             # Belt-and-suspenders: every expected failure below already sets
             # status="error" itself (with a specific message) and returns, but
             # an exception this doesn't anticipate -- e.g. a PermissionError
-            # from a misconfigured NFS_DIR/SMB_DIR mount, not a
+            # from a misconfigured SMB_DIR mount, not a
             # subprocess.CalledProcessError -- must still land the image
             # somewhere other than "processing" forever. That status has no
             # Retry button (see templates/images.html), so without this an
@@ -891,22 +947,14 @@ def _run_extraction(db, img: Image) -> None:
         db.commit()
         return
 
-    needs_nfs, http_files, guessed_args = _netboot_plan(
+    http_files, guessed_args = _netboot_plan(
         entries, img.filename, img.id)
 
-    if needs_nfs:
-        # Unpack the live filesystem so it can be exported.
-        try:
-            _extract_tree(iso, config.NFS_DIR / str(img.id))
-        except subprocess.CalledProcessError as e:
-            img.status = "error"
-            img.message = f"Live filesystem extraction failed: {e.stderr or e}"
-            db.commit()
-            return
-    elif http_files:
-        # Single-file HTTP root (Fedora 42+ live, Archiso): extract just the
-        # root filesystem (+ any checksum) into the bootroot, preserving the
-        # subpath the bootloader expects, so it can be streamed over HTTP.
+    if http_files:
+        # Single-file HTTP root (Debian live-boot squashfs, Fedora 42+ live,
+        # Archiso): extract just the root filesystem (+ any checksum) into
+        # the bootroot, preserving the subpath the bootloader expects, so it
+        # can be streamed over HTTP.
         try:
             for member, relpath in http_files:
                 _extract_one(iso, member, dest_dir / relpath)
@@ -967,8 +1015,10 @@ def _required_paths(img: Image) -> list[Path]:
     else:
         # Linux: whatever the boot args send the client to beyond kernel+initrd.
         args = img.boot_args or ""
-        if "netboot=nfs" in args:
-            paths.append(config.NFS_DIR / str(img.id))
+        if "netboot=url" in args:  # casper: fetches the whole ISO itself
+            paths.append(iso_path(img.filename))
+        if "fetch=" in args:  # live-boot: HTTP squashfs-only fetch
+            paths.append(dest_dir / "filesystem.squashfs")
         if "rd.live.image" in args:  # Fedora 42+ live: HTTP squashfs root
             paths.append(dest_dir / "squashfs.img")
         basedir = re.search(r"archisobasedir=(\S+)", args)
@@ -994,10 +1044,10 @@ def reconcile_statuses(db) -> int:
 
     `status` records how the last extraction went; it says nothing about whether
     what that extraction produced still exists. Destroying and recreating the
-    bootroot/nfsroot/smbroot volumes while the database — a bind mount —
-    survives leaves rows still marked `ready` that point at nothing. Those images
-    were listed in the boot menu and failed at the client with nothing pointing
-    at the real cause.
+    bootroot/smbroot volumes while the database — a bind mount — survives
+    leaves rows still marked `ready` that point at nothing. Those images were
+    listed in the boot menu and failed at the client with nothing pointing at
+    the real cause.
 
     Runs at startup, which is the only moment the volumes can have changed
     without Lantern doing it, and is when the boot menu is regenerated anyway.
@@ -1037,7 +1087,6 @@ def delete_image(db, img: Image) -> None:
     iso.unlink(missing_ok=True)
     extracted = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id)
     shutil.rmtree(extracted, ignore_errors=True)
-    shutil.rmtree(config.NFS_DIR / str(img.id), ignore_errors=True)
     shutil.rmtree(config.SMB_DIR / str(img.id), ignore_errors=True)
     db.delete(img)
     db.commit()
