@@ -2,9 +2,9 @@
 
 Working notes from the decision to build this as a separate project
 rather than a Podman port of [Beacon](https://github.com/acebmxer/beacon_pxe).
-This is the topology to build against. The web layer and the host-level
-DHCP/TFTP service are built; the NFS replacement and SMB placement are
-still open.
+This is the topology to build against. The web layer, the host-level
+DHCP/TFTP service, and the containerized HTTP boot root are built; the NFS
+replacement and SMB placement are still open.
 
 ## Constraint
 

@@ -26,10 +26,25 @@ root systemd unit on the host, and a systemd path unit applies the web app's
 Installed with `sudo host/install.sh <data dir>`. The design is in
 [docs/design.md](docs/design.md)'s "DHCP/TFTP" section.
 
+Stage 3 built: the HTTP boot root (`httpboot/`), a containerized, rootless
+nginx serving `BOOTROOT_DIR` (boot.ipxe, kernels/initrds, squashfs, wimboot,
+the XCP-NG GRUB chainload) and reverse-proxying `/track/` to the web app.
+Uses `nginxinc/nginx-unprivileged` running as uid 1000, the same uid the web
+app writes as — the plain `nginx` image's usual root-then-drop-privileges
+pattern needs `CAP_NET_BIND_SERVICE` to bind port 80 itself, which rootless
+Podman won't grant, and a fresh named volume shared by two containers with
+different uids doesn't get auto-owned to either of them (verified: the web
+app's own writes into a shared `bootroot` volume failed permission checks
+until both containers ran as the same uid). The bootroot volume mount is
+`:z` (shared SELinux label), not `:Z` (private) — verified `:Z` locks the
+second container out under SELinux enforcing. The host still has to allow
+binding port 80 as non-root (`net.ipv4.ip_unprivileged_port_start`); see
+[README.md](README.md).
+
 Not built yet, per the open questions in [docs/design.md](docs/design.md):
-the NFS/HTTP boot-root choice (including the HTTP server that serves
-`boot.ipxe`) and SMB placement. Extraction stages files under
-`NFS_DIR`/`SMB_DIR`, but nothing serves them yet.
+NFS (needed for Debian/Ubuntu live images' netboot root) and SMB placement
+(needed for Windows install media once WinPE starts). Extraction stages
+files under `NFS_DIR`/`SMB_DIR`, but nothing serves them yet.
 
 Beacon's Docker-socket self-update feature was deliberately not ported — it
 isn't in design.md's "what carries over" list and conflicts with the

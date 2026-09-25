@@ -823,93 +823,111 @@ def process_image(image_id: int) -> None:
         # Mark active extraction so the UI can distinguish "queued" from "working".
         img.status = "processing"
         db.commit()
-        # Wipe any artifacts from a previous run before re-extracting, so a
-        # changed family/netboot method can't leave stale (possibly huge) data.
-        _clean_derived_data(image_id)
-        iso = iso_path(img.filename)
         try:
-            entries = _list_iso(iso)
-        except subprocess.CalledProcessError as e:
+            _run_extraction(db, img)
+        except Exception:
+            # Belt-and-suspenders: every expected failure below already sets
+            # status="error" itself (with a specific message) and returns, but
+            # an exception this doesn't anticipate -- e.g. a PermissionError
+            # from a misconfigured NFS_DIR/SMB_DIR mount, not a
+            # subprocess.CalledProcessError -- must still land the image
+            # somewhere other than "processing" forever. That status has no
+            # Retry button (see templates/images.html), so without this an
+            # admin's only way out is deleting and re-uploading the image.
+            log.exception("Unexpected failure processing image %s", img.name)
             img.status = "error"
-            img.message = f"Could not read ISO: {e.stderr or e}"
+            img.message = "Unexpected error during processing; see server logs."
             db.commit()
-            return
-
-        family = _detect_family(entries)
-        img.os_family = family
-        if family == "windows":
-            _process_windows(db, img, iso, entries)
-            ipxe.render(db)
-            log.info("Image %s ready (%s)", img.name, family)
-            return
-
-        if family == "xcpng":
-            # Xen multiboot installer; handled separately from Linux kernel+initrd.
-            _process_xcpng(db, img, iso)
-            ipxe.render(db)
-            log.info("Image %s ready (%s)", img.name, family)
-            return
-
-        kernel = _match(entries, KERNEL_PATTERNS)
-        initrd = _match(entries, INITRD_PATTERNS)
-        if not kernel or not initrd:
-            img.status = "error"
-            img.message = ("Could not locate kernel/initrd in ISO. You may set "
-                           "paths manually after checking the ISO layout.")
-            db.commit()
-            return
-        # Keep the initrd on the same kernel flavour (multi-kernel Arch ISOs).
-        initrd = _pair_initrd(kernel, initrd, entries)
-
-        dest_dir = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id)
-        try:
-            _extract_one(iso, kernel, dest_dir / "vmlinuz")
-            _extract_one(iso, initrd, dest_dir / "initrd")
-        except subprocess.CalledProcessError as e:
-            img.status = "error"
-            img.message = f"Extraction failed: {e.stderr or e}"
-            db.commit()
-            return
-
-        needs_nfs, http_files, guessed_args = _netboot_plan(
-            entries, img.filename, img.id)
-
-        if needs_nfs:
-            # Unpack the live filesystem so it can be exported.
-            try:
-                _extract_tree(iso, config.NFS_DIR / str(img.id))
-            except subprocess.CalledProcessError as e:
-                img.status = "error"
-                img.message = f"Live filesystem extraction failed: {e.stderr or e}"
-                db.commit()
-                return
-        elif http_files:
-            # Single-file HTTP root (Fedora 42+ live, Archiso): extract just the
-            # root filesystem (+ any checksum) into the bootroot, preserving the
-            # subpath the bootloader expects, so it can be streamed over HTTP.
-            try:
-                for member, relpath in http_files:
-                    _extract_one(iso, member, dest_dir / relpath)
-            except subprocess.CalledProcessError as e:
-                img.status = "error"
-                img.message = f"Live filesystem extraction failed: {e.stderr or e}"
-                db.commit()
-                return
-
-        img.kernel_path = f"{EXTRACT_SUBDIR}/{img.id}/vmlinuz"
-        img.initrd_path = f"{EXTRACT_SUBDIR}/{img.id}/initrd"
-        # Reprocess regenerates everything, so reset boot args to the freshly
-        # guessed ones — a changed family/layout must not keep stale args (e.g.
-        # an Archiso image left on a previous run's bare ip=dhcp).
-        img.boot_args = guessed_args
-        img.status = "ready"
-        img.message = f"Extracted {Path(kernel).name} + {Path(initrd).name}"
-        db.commit()
-
-        ipxe.render(db)
-        log.info("Image %s ready (%s)", img.name, family)
     finally:
         db.close()
+
+
+def _run_extraction(db, img: Image) -> None:
+    # Wipe any artifacts from a previous run before re-extracting, so a
+    # changed family/netboot method can't leave stale (possibly huge) data.
+    _clean_derived_data(img.id)
+    iso = iso_path(img.filename)
+    try:
+        entries = _list_iso(iso)
+    except subprocess.CalledProcessError as e:
+        img.status = "error"
+        img.message = f"Could not read ISO: {e.stderr or e}"
+        db.commit()
+        return
+
+    family = _detect_family(entries)
+    img.os_family = family
+    if family == "windows":
+        _process_windows(db, img, iso, entries)
+        ipxe.render(db)
+        log.info("Image %s ready (%s)", img.name, family)
+        return
+
+    if family == "xcpng":
+        # Xen multiboot installer; handled separately from Linux kernel+initrd.
+        _process_xcpng(db, img, iso)
+        ipxe.render(db)
+        log.info("Image %s ready (%s)", img.name, family)
+        return
+
+    kernel = _match(entries, KERNEL_PATTERNS)
+    initrd = _match(entries, INITRD_PATTERNS)
+    if not kernel or not initrd:
+        img.status = "error"
+        img.message = ("Could not locate kernel/initrd in ISO. You may set "
+                       "paths manually after checking the ISO layout.")
+        db.commit()
+        return
+    # Keep the initrd on the same kernel flavour (multi-kernel Arch ISOs).
+    initrd = _pair_initrd(kernel, initrd, entries)
+
+    dest_dir = config.BOOTROOT_DIR / EXTRACT_SUBDIR / str(img.id)
+    try:
+        _extract_one(iso, kernel, dest_dir / "vmlinuz")
+        _extract_one(iso, initrd, dest_dir / "initrd")
+    except subprocess.CalledProcessError as e:
+        img.status = "error"
+        img.message = f"Extraction failed: {e.stderr or e}"
+        db.commit()
+        return
+
+    needs_nfs, http_files, guessed_args = _netboot_plan(
+        entries, img.filename, img.id)
+
+    if needs_nfs:
+        # Unpack the live filesystem so it can be exported.
+        try:
+            _extract_tree(iso, config.NFS_DIR / str(img.id))
+        except subprocess.CalledProcessError as e:
+            img.status = "error"
+            img.message = f"Live filesystem extraction failed: {e.stderr or e}"
+            db.commit()
+            return
+    elif http_files:
+        # Single-file HTTP root (Fedora 42+ live, Archiso): extract just the
+        # root filesystem (+ any checksum) into the bootroot, preserving the
+        # subpath the bootloader expects, so it can be streamed over HTTP.
+        try:
+            for member, relpath in http_files:
+                _extract_one(iso, member, dest_dir / relpath)
+        except subprocess.CalledProcessError as e:
+            img.status = "error"
+            img.message = f"Live filesystem extraction failed: {e.stderr or e}"
+            db.commit()
+            return
+
+    img.kernel_path = f"{EXTRACT_SUBDIR}/{img.id}/vmlinuz"
+    img.initrd_path = f"{EXTRACT_SUBDIR}/{img.id}/initrd"
+    # Reprocess regenerates everything, so reset boot args to the freshly
+    # guessed ones — a changed family/layout must not keep stale args (e.g.
+    # an Archiso image left on a previous run's bare ip=dhcp).
+    img.boot_args = guessed_args
+    img.status = "ready"
+    img.message = f"Extracted {Path(kernel).name} + {Path(initrd).name}"
+    db.commit()
+
+    ipxe.render(db)
+    log.info("Image %s ready (%s)", img.name, family)
 
 
 def _exists_nonempty(path: Path) -> bool:

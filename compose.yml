@@ -1,9 +1,11 @@
-# Lantern PXE — web layer. DHCP/TFTP runs on the host, not here: install it
-# with `sudo host/install.sh "$PWD/data"` once this container has started (see
-# README.md). HTTP boot root, NFS and SMB aren't built yet (docs/design.md).
+# Lantern PXE — web layer + HTTP boot root. DHCP/TFTP runs on the host, not
+# here: install it with `sudo host/install.sh "$PWD/data"` once this container
+# has started (see README.md). NFS and SMB boot paths aren't built yet
+# (docs/design.md).
 #
-# Builds and runs the FastAPI management UI + API in a rootless Podman
-# container: no privileged flags, no host networking, no socket mounts.
+# Builds and runs the FastAPI management UI + API, and the nginx HTTP boot
+# root, as rootless Podman containers: no privileged flags, no host
+# networking, no socket mounts.
 #
 #   1. Copy .env.example to .env and edit it.
 #   2. podman compose up -d --build   (or: docker compose up -d --build)
@@ -30,13 +32,51 @@ services:
       SMB_DIR: /smb
     volumes:
       - ./data:/data:Z
-      - bootroot:/bootroot
+      # :z (shared), not :Z (private) -- the httpboot container below reads
+      # this same volume. :Z would give each container its own SELinux MCS
+      # category and lock the other out (SELinux enforcing: verified this
+      # fails with "Permission denied" on files the other container wrote).
+      - bootroot:/bootroot:z
       - ${IMAGE_PATH:-./data/images}:/images:Z
       - nfsroot:/nfs
       - smbroot:/smb
       - ./data/drivers:/smb/drivers:Z
     ports:
       - "${WEB_PORT:-8080}:8080"
+
+  httpboot:
+    # -unprivileged variant: listens on 8080 and runs as a non-root user by
+    # design, instead of nginx's usual "root starts, binds 80, drops to the
+    # nginx user" pattern. Rootless Podman can't grant CAP_NET_BIND_SERVICE
+    # for that pattern to bind 80 itself, and running it as uid 1000 (below)
+    # is also what lets it share the bootroot volume with the web
+    # container's own uid-1000 process -- Podman only auto-owns a fresh named
+    # volume to one uid, and here that has to be the uid the web app writes
+    # as, not root.
+    image: docker.io/nginxinc/nginx-unprivileged:1.27-alpine
+    container_name: lantern-httpboot
+    restart: unless-stopped
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /tmp
+    volumes:
+      - bootroot:/bootroot:ro,z
+      - ./httpboot/nginx.conf:/etc/nginx/conf.d/default.conf:ro,Z
+      - ./httpboot/docker-entrypoint.d/40-resolver.sh:/docker-entrypoint.d/40-resolver.sh:ro,Z
+    ports:
+      # PXE clients reach this over plain HTTP with no port in the URL
+      # (web/app/services/ipxe.py's ${boot-url} is http://<server_ip>), so the
+      # host side is fixed at 80, not a *_PORT env var like the web UI's
+      # 8080 -- changing it would silently break every generated boot.ipxe.
+      # (The container's own listen port, 8080, is a separate, internal detail
+      # -- see httpboot/nginx.conf.)
+      - "80:8080"
+    depends_on:
+      - web
 
 volumes:
   bootroot:
